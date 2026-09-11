@@ -50,7 +50,7 @@ sudo ip link set can0 up
 ### Running teleop
 
 ```bash
-cd yam_teleop
+cd yam_vr_teleop
 
 # Right arm only
 .venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --gripper
@@ -72,10 +72,10 @@ cd yam_teleop
 # Debug: print controller stream (no hardware)
 .venv/bin/python -m deployment.quest_teleop --dump
 
-# Calibrate operator frame (run per arm, per standing position)
-# left arm
-.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --calibrate
+# Calibrate operator frame (only needed if you change where you stand)
 # right arm
+.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --calibrate
+# left arm
 .venv/bin/python -m deployment.quest_teleop --config deployment/config_left.yaml --calibrate
 
 # Pre-flight checks (Checks CAN(s), motors, joint limits. No motors activate)
@@ -185,12 +185,18 @@ Each arm has its own YAML config. Key sections:
 - **Console shows `lag=` values:** The slew cap is binding. Raise `max_tray_speed_m_s`.
 - **Console shows `pinned=j2,j3`:** IK is against a joint limit. Tighten the operator box or adjust your approach angle.
 
-## Before real hardware
+## Lab setup notes
 
-1. **Verify CAN adapter mapping.** Each adapter has a USB serial; the config's `adapter_serial` must match the physical arm that adapter is plugged into. Set `mapping_verified: true` only after confirming. The script refuses to start without it.
+The configs ship with the correct CAN adapter serials and channel mappings for our lab's two YAM arms (`mapping_verified: true`). The operator frame calibration files are also included — they're valid as long as you stand in the same spot as the original calibration. If you move to a different position, re-run `--calibrate` for each arm.
+
+**CAN mapping:** Right arm is on `can1`, left arm is on `can0`. This is already set in the configs.
+
+**If you're setting up on a different machine or different arms**, you'll need to:
+
+1. **Verify CAN adapter mapping.** Check which USB serial is on which CAN interface (`/sys/class/net/canX/device/.../serial`), update `adapter_serial` and `channel` in both configs, and set `mapping_verified: true`.
 2. **Run preflight.** It checks CAN, motor chain, gripper type, joint limits, and operator frame — without energizing anything.
-3. **Tighten the joint box.** The default `±3.0 rad` constrains nothing. There is **no collision checking** — the operator box is the only thing keeping two arms apart.
-4. **Record the reset pose.** The default all-zeros is the folded rest position. For a working start pose, hand-guide the arm in gravity comp and record the joint positions into `deploy.reset_joint_position_rad` or `balancing_act/yam_home.json`.
+3. **Calibrate the operator frame.** Run `--calibrate` for each arm from where you'll stand.
+4. **Tighten the joint box.** The default `±3.0 rad` constrains nothing. There is **no collision checking** — the operator box is the only thing keeping two arms apart.
 
 ## Requirements
 
