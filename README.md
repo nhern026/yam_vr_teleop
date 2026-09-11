@@ -1,14 +1,40 @@
-# yam_teleop
+# yam_vr_teleop
 
 Meta Quest VR teleoperation for YAM 6-DOF arms. One or two arms in a single process, driven by Quest 3 controllers over USB.
+
+## Prerequisites (fresh Linux machine)
+
+```bash
+# Python 3.11
+sudo apt update && sudo apt install -y python3.11 python3.11-venv python3.11-dev
+
+# uv (fast Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc   # or restart your shell
+
+# Android Debug Bridge (for Quest communication)
+sudo apt install -y android-tools-adb
+
+# CAN utilities (for real hardware)
+sudo apt install -y can-utils iproute2
+```
+
+### Quest setup
+
+1. Enable **Developer Mode** on your Quest 3 (Settings → System → Developer)
+2. Connect Quest to the PC via USB-C
+3. Put on the headset and accept the **Allow USB debugging** prompt
+4. Verify: `adb devices` should show your device as `device` (not `unauthorized`)
 
 ## Quick start
 
 ```bash
-# Setup (once)
+# Clone and setup
+git clone git@github.com:nhern026/yam_vr_teleop.git
+cd yam_vr_teleop
 uv venv --python 3.11 && source .venv/bin/activate
 uv pip install -r requirements.txt
-uv pip install -e /path/to/i2rt          # or: uv pip install "i2rt @ git+https://github.com/i2rt-robotics/i2rt"
+uv pip install "i2rt @ git+https://github.com/i2rt-robotics/i2rt"  # or: uv pip install -e /path/to/local/i2rt
 ```
 
 ### CAN setup (real hardware)
