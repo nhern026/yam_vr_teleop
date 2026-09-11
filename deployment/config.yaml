@@ -1,0 +1,53 @@
+# Quest -> YAM teleop, right hand -> arm on can0.
+# Values marked TUNE are starting guesses, not the original authors' numbers.
+
+teleop:
+  hand: right
+  control_hz: 100.0
+  position_scale: 1.0          # metres of tray motion per metre of hand motion
+  yaw_deg: 0.0                 # only used when there is no calibration file
+  orientation: true             # true = track controller rotation for wrist control
+  max_tray_speed_m_s: 0.5     # TUNE: final slew guard; raise if lag= stays up
+  max_tray_omega_rad_s: 1.5    # TUNE
+  filter_min_cutoff_hz: 2.5    # TUNE: lower = steadier resting hand, more lag
+  filter_beta: 8.0             # TUNE: higher = less lag when moving fast
+  max_hand_jump_m: 0.08        # a per-tick jump bigger than this is a tracking glitch
+  joint_smoothing_tau_s: 0.01  # 0 disables the joint-space smoothing stage
+  watchdog_s: 0.15             # stream older than this counts as lost (app runs ~70 Hz)
+  move_s: 3.0                  # duration of the homing / parking moves
+  settle_s: 0.5
+  print_hz: 10.0
+  apk_path: assets/teleop-debug.apk          # relative to this file
+  frame_path: calibration/quest_frame_right.json
+
+robot:
+  backend: i2rt                # i2rt (real CAN) / sim (i2rt MuJoCo SimRobot) / mock
+  channel: can1
+  arm_type: yam                # yam / yam_pro / yam_ultra / big_yam, as named in i2rt's ArmType
+  gripper_type: linear_4310
+  mapping_verified: true
+  adapter_serial: "0022005F594E501820313332"
+  # Seed pose for the sim backend. NOT zeros: the YAM's j2/j3 lower limits are
+  # exactly 0.0, so an all-zeros start sits on two joint limits and IK pins.
+  sim_initial_joint_position_rad: [0.0, 0.9, 1.2, 0.0, 0.6, 0.0]
+  mock_servo_tau_s: 0.05
+  mock_initial_joint_position_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+safety:
+  max_command_velocity_rad_s: 1.5  # maximum change of commanded joint angle per second
+  max_command_offset_rad: 0.25     # target never further than this from measured, per joint
+  max_joint_velocity_rad_s: 3.0    # measured speed above this parks the arm
+  # Operator box, intersected with the model's mechanical limits. TUNE: tighten
+  # to keep the arm off the table and away from the other arm.
+  joint_position_min_rad: [-3.0, -3.0, -3.0, -3.0, -3.0, -3.0]
+  joint_position_max_rad: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+
+deploy:
+  # Ready pose this arm homes to at start-up and on A/X. Per-arm on purpose:
+  # two arms facing each other do not share one. Commented out means fall back
+  # to balancing_act/yam_home.json. TUNE: record it on your own arm.
+  # reset_joint_position_rad: [0.0, 1.5886, 0.9016, 1.0007, 0.6594, 0.0]
+  #
+  # Folded pose the arm parks in on every exit. TUNE: i2rt's zero is assumed to
+  # be the rest pose; verify on your arm before trusting it.
+  home_joint_position_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

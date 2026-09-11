@@ -1,0 +1,25 @@
+# Core stack. These install cleanly on Linux and Windows alike.
+numpy
+mujoco
+mink
+quadprog
+pyyaml
+
+# i2rt supplies the YAM model and the arm driver, and is needed even with
+# --backend sim, because TeleopIK builds its model from i2rt's own MJCF.
+#
+#   Linux:    uv pip install "i2rt @ git+https://github.com/i2rt-robotics/i2rt"
+#
+#   Windows:  the line above FAILS -- i2rt depends on ruckig, which does not
+#             build (scikit-build-core >= 0.10 incompatibility). Install it
+#             without deps and add the ones the imports actually need:
+#
+#               uv pip install --no-deps "i2rt @ git+https://github.com/i2rt-robotics/i2rt"
+#               uv pip install python-can tyro pydantic crcmod dm_env \
+#                              mcap mcap-protobuf-support mcap-ros2-support
+#
+#             i2rt also hardcodes /tmp for the generated MJCF, which on Windows
+#             is C:\tmp. Create it or every IK startup raises FileNotFoundError.
+#
+# Real arms need Linux regardless: i2rt drives the motors over socketcan, which
+# has no Windows implementation. See the README for the WSL2 route.

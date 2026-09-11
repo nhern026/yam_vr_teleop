@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Reset pose: the arm raised and reaching out over the table, ready to be driven.",
+    "Teleop walks here at start-up and on the A button.",
+    "",
+    "THIS IS A SIM DEFAULT, not a measured pose. It puts the grasp_site at about",
+    "(0.35, 0.00, 0.30) m in the arm's base frame, with at least 0.57 rad of margin",
+    "on every joint, which is enough for IK to move freely in all directions.",
+    "",
+    "Before driving a real arm, re-record it for your own table: bring the arm up in",
+    "gravity compensation, hand-guide it to a comfortable ready pose, and copy the",
+    "joint readout here. See the README.",
+    "",
+    "Do NOT set this to all zeros: the YAM's j2 and j3 lower limits are exactly 0.0,",
+    "so a zeros pose sits on two joint limits and IK pins immediately."
+  ],
+  "joint_position_rad": [0.0, 1.5886, 0.9016, 1.0007, 0.6594, 0.0],
+
+  "_comment_verified": [
+    "Set this to true once you have recorded this pose on the real arm and",
+    "confirmed the arm can reach it without hitting the table or a fixture.",
+    "Until then the i2rt backend refuses to start, because homing is a 3 s move",
+    "the operator cannot interrupt with the clutch."
+  ],
+  "verified_on_hardware": false
+}
