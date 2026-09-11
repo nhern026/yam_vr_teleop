@@ -92,7 +92,7 @@ cd yam_vr_teleop
 | Pause both arms | B (right) / Y (left) |
 | Resume from pause | A (right) / X (left) |
 
-**Exiting:** Press B/Y to park the arms first, then Ctrl-C. If you Ctrl-C directly, gravity comp turns off and the arms drop — support them.
+**Exiting:** Press B/Y **on the Quest controller** to park the arms first, wait for them to settle, then Ctrl-C **in the terminal**. If you Ctrl-C without parking first, gravity comp turns off instantly and the arms drop — support them.
 
 ## Architecture
 ```
