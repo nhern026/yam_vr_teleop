@@ -97,13 +97,17 @@ Open `http://localhost:8080` (or your custom port) in a browser to see live join
 | Action | Button |
 |--------|--------|
 | Clutch (engage arm tracking) | Grip button (side button) |
-| Close gripper | Trigger while clutched |
+| Gripper (proportional) | Trigger while clutched (squeeze = close) |
 | Open gripper | Trigger while NOT clutched |
 | Pause both arms | B (right) / Y (left) |
-| Resume from pause | A (right) / X (left) |
+| Home to start position | A (right) / X (left) |
 | Start/stop recording | Joystick click (either hand, requires `--record`) |
 
-**Exiting:** Press B/Y **on the Quest controller** to park the arms first, wait for them to settle, then Ctrl-C **in the terminal**. If you Ctrl-C without parking first, gravity comp turns off instantly and the arms drop — support them.
+The gripper is proportional: squeezing the trigger halfway closes the gripper halfway, which matters for delicate tasks like handling vials.
+
+**Homing:** pressing A/X from a paused state moves both arms to their start position (`deploy.reset_joint_position_rad` in the config, or the shared `yam_home.json` fallback). The move takes `teleop.move_s` seconds with smooth easing. Use this between demos so each one starts from the same pose.
+
+**Exiting:** Press B/Y to park the arms, then Ctrl-C in the terminal. The arms enter gravity comp (they float but don't fall). Support the arms, then press Enter to disable motors.
 
 ### All CLI flags
 
@@ -179,12 +183,29 @@ sudo ip link set can0 up
 
 Repeat for `can1` if using two arms. Right arm is on `can1`, left arm is on `can0` (already set in configs).
 
+### Recording a start pose
+
+Record a pose so that A/X always homes the arm to the same position between demos.
+
+```bash
+# Right arm — guide the arm by hand, press Enter to capture
+.venv/bin/python -m deployment.record_pose --channel can1 --gripper linear_4310
+```
+
+```bash
+# Left arm
+.venv/bin/python -m deployment.record_pose --channel can0 --gripper linear_4310
+```
+
+Paste the printed values into the arm's config under `deploy.reset_joint_position_rad`. Without this key the arm homes to the shared `yam_home.json` fallback.
+
 ### New machine / different arms
 
 1. **Verify CAN adapter mapping.** Check which USB serial is on which CAN interface (`/sys/class/net/canX/device/.../serial`), update `adapter_serial` and `channel` in both configs, set `mapping_verified: true`.
 2. **Run preflight.** Checks CAN, motor chain, gripper type, joint limits — without energizing anything.
 3. **Calibrate the operator frame.** Run `--calibrate` for each arm from where you'll stand.
-4. **Tighten the joint box.** The default `±3.0 rad` constrains nothing. There is **no collision checking** — the operator box is the only thing keeping two arms apart.
+4. **Record a start pose.** Run `record_pose` for each arm and paste the result into the config (see above).
+5. **Tighten the joint box.** The default `±3.0 rad` constrains nothing. There is **no collision checking** — the operator box is the only thing keeping two arms apart.
 
 ## Requirements
 

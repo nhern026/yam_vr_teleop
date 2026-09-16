@@ -177,6 +177,11 @@ class I2rtArm:
         raise ValueError("gripper opening must be finite and between 0 and 1")
       self._gripper_target = float(position)
 
+  def enter_gravity_comp(self) -> None:
+    """Drop PD targets but keep gravity comp running. Arms float but don't fall."""
+    if self._robot is not None:
+      self._robot.enter_gravity_comp_idle()
+
   def close(self) -> None:
     if self._robot is not None:
       self._robot.close()

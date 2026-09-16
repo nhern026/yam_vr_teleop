@@ -27,7 +27,7 @@ print(f"filter ok (moving lag at 0.5 m/s: {lag*1000:.1f} mm)")
 cfg = load_deployment_config(str(ROOT / "deployment") + "/config.yaml")
 assert Path(cfg["teleop"]["frame_path"]).parent == ROOT / "deployment" / "calibration"
 left = load_deployment_config(str(ROOT / "deployment") + "/config_left.yaml")
-assert left["teleop"]["hand"] == "left" and left["robot"]["channel"] == "can1"
+assert left["teleop"]["hand"] == "left" and left["robot"]["channel"] == "can0"
 tmp = Path(tempfile.mkdtemp()) / "bad.yaml"
 tmp.write_text("teleop: {hand: right}\nrobot: {backend: mock}\n")
 try: load_deployment_config(tmp); raise SystemExit("should have failed")

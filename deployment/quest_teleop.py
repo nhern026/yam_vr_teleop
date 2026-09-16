@@ -798,6 +798,7 @@ class ArmChannel:
       if reset is None
       else np.asarray(reset, dtype=np.float64)
     )
+    self.park_pose = np.asarray(config["deploy"]["home_joint_position_rad"], dtype=np.float64)
     # Gripper: the analogue trigger drives it, which is why the grip button
     # takes over the clutch when it is on. Without a gripper the channel never
     # calls command_gripper and the trigger keeps its clutch duty.
@@ -853,6 +854,11 @@ class ArmChannel:
     self._arm.command_arm_positions(bounded)
     self._last_command = bounded.copy()
     self.hold = bounded.copy()
+
+  def enter_gravity_comp(self) -> None:
+    """Drop PD targets but keep gravity comp running, if the backend supports it."""
+    if hasattr(self._arm, 'enter_gravity_comp'):
+      self._arm.enter_gravity_comp()
 
   def close(self) -> None:
     self._arm.close()
@@ -984,14 +990,12 @@ class ArmChannel:
     return sample.clutch
 
   def _gripper_of(self, sample: ControllerSample) -> float:
-    """Toggle gripper: trigger while clutched = close, trigger while released = open.
+    """Proportional: the trigger's analog value sets the grip target.
 
-    i2rt convention: 0 shut, 1 open. While clutched, any trigger press drives
-    toward closed. Opening is handled in drive() when the clutch is released.
+    Full squeeze → closed (0), released → open (1). The ramp in drive()
+    limits how fast the gripper moves; the trigger just says where.
     """
-    if sample.trigger > 0.5:
-      return 0.0
-    return self._gripper_command
+    return 1.0 - sample.trigger
 
   # ------------------------------------------------------------------- status
 
@@ -1105,22 +1109,32 @@ class TeleopSession:
   def alive(self) -> bool:
     return self._thread.is_alive()
 
-  def close(self) -> None:
-    """Stop commanding, then close every driver. Arms need physical support."""
-    if self._closed:
-      return
+  def enter_gravity_comp(self) -> None:
+    """Stop the control loop and enter gravity comp. Arms float but don't fall.
+
+    Call this before close() to give the operator time to support the arms.
+    The motor driver stays alive — gravity comp torques keep flowing.
+    """
     self._shutdown.set()
     if self._thread.is_alive():
       self._thread.join(timeout=5.0)
       if self._thread.is_alive():
         raise RuntimeError("Control thread did not stop. Use physical emergency stop.")
+    for channel in self._channels:
+      channel.enter_gravity_comp()
+
+  def close(self) -> None:
+    """Disable motors and release all resources. Arms will fall."""
+    if self._closed:
+      return
+    if not self._shutdown.is_set():
+      self.enter_gravity_comp()
     errors = []
     for channel in self._channels:
       try:
         channel.close()
       except Exception as exc:
         errors.append(str(exc))
-    # After the motors are safe: a driver fault must not cost the demo.
     self._finish_recording()
     if self._dashboard is not None:
       self._dashboard.close()
@@ -1223,9 +1237,8 @@ class TeleopSession:
         if self._recorder is not None and self._recorder.recording:
           self._save_recording()
       elif resume and self._mode == PARKED and self._fault is None:
-        self._mode = IDLE
-        for channel in self._channels:
-          channel.release_input()
+        self._begin_move(HOMING, [channel.reset_pose for channel in self._channels])
+        self._note = "homing to start position..."
       if js_click and self._recorder is not None:
         if self._recorder.recording:
           self._save_recording()
@@ -1804,19 +1817,27 @@ def main() -> None:
       print(f"Recording to {args.record}/. Click joystick to start/stop recording.")
     if args.dashboard:
       print(f"Dashboard: http://localhost:{args.dashboard}")
-    print("Support both arms before Ctrl-C: exiting disables motors.\n")
+    print("B/Y parks the arms. After parking, Ctrl-C to begin shutdown.\n")
+    is_real = any(ch.backend == "i2rt" for ch in session.channels)
     session.start()
     try:
       while session.alive():
         if not reader.alive():
-          print("\nadb stream stopped. Support arms; closing drivers.", flush=True)
+          print("\nadb stream stopped.", flush=True)
           break
         time.sleep(0.2)
     except KeyboardInterrupt:
-      print("\nclosing drivers; arms must be supported.", flush=True)
+      pass
     finally:
-      # close() stops the loop, closes the drivers, then flushes any
-      # in-progress recording and waits for pending writes.
+      if is_real:
+        session.enter_gravity_comp()
+        print("\nArms in gravity comp — they will float but not fall.")
+        print("Support the arms, then press Enter to disable motors.", flush=True)
+        try:
+          input()
+        except (KeyboardInterrupt, EOFError):
+          pass
+        print("Disabling motors...", flush=True)
       session.close()
     if session.status()["fault"]:
       raise RuntimeError(session.status()["fault"])

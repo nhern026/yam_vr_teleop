@@ -185,8 +185,12 @@ try:
   reader.home["left"] = True
   time.sleep(.1)
   reader.home["left"] = False
+  assert session.status()["mode"] == qt.HOMING, session.status()
+  time.sleep(1.5)  # move_s=1.0 + settle_s=0.2
   assert session.status()["mode"] == qt.IDLE, session.status()
-  print("shared pause/resume ok (neither arm parks)")
+  for channel in session.channels:
+    assert np.allclose(channel.read_state().joint_position, channel.reset_pose, atol=1e-2)
+  print("shared pause/resume ok (homes to reset pose)")
 finally:
   session.close()
 

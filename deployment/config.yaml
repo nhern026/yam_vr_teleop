@@ -4,15 +4,15 @@
 teleop:
   hand: right
   control_hz: 100.0
-  position_scale: 1.0          # metres of tray motion per metre of hand motion
+  position_scale: 0.5          # 2:1 precision ratio — halves robot motion per hand motion
   yaw_deg: 0.0                 # only used when there is no calibration file
   orientation: true             # true = track controller rotation for wrist control
-  max_tray_speed_m_s: 0.5     # TUNE: final slew guard; raise if lag= stays up
-  max_tray_omega_rad_s: 1.5    # TUNE
-  filter_min_cutoff_hz: 2.5    # TUNE: lower = steadier resting hand, more lag
-  filter_beta: 8.0             # TUNE: higher = less lag when moving fast
+  max_tray_speed_m_s: 0.3     # slew guard tuned for precision; raise if lag= stays up
+  max_tray_omega_rad_s: 1.0    # rotation cap for steady wrist control
+  filter_min_cutoff_hz: 1.5    # heavier low-pass on resting hand — steadier for science
+  filter_beta: 5.0             # less reactive speed adaptation — smoother transitions
   max_hand_jump_m: 0.08        # a per-tick jump bigger than this is a tracking glitch
-  joint_smoothing_tau_s: 0.01  # 0 disables the joint-space smoothing stage
+  joint_smoothing_tau_s: 0.04  # joint-space EMA removes motor chatter (~100 ms settling)
   watchdog_s: 0.15             # stream older than this counts as lost (app runs ~70 Hz)
   move_s: 3.0                  # duration of the homing / parking moves
   settle_s: 0.5
@@ -34,7 +34,7 @@ robot:
   mock_initial_joint_position_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 safety:
-  max_command_velocity_rad_s: 1.5  # maximum change of commanded joint angle per second
+  max_command_velocity_rad_s: 1.0  # maximum change of commanded joint angle per second
   max_command_offset_rad: 0.25     # target never further than this from measured, per joint
   max_joint_velocity_rad_s: 3.0    # measured speed above this parks the arm
   # Operator box, intersected with the model's mechanical limits. TUNE: tighten
