@@ -91,8 +91,75 @@ cd yam_vr_teleop
 | Open gripper | Trigger while NOT clutched |
 | Pause both arms | B (right) / Y (left) |
 | Resume from pause | A (right) / X (left) |
+| Start/stop recording | Joystick click (either hand, requires `--record`) |
 
 **Exiting:** Press B/Y **on the Quest controller** to park the arms first, wait for them to settle, then Ctrl-C **in the terminal**. If you Ctrl-C without parking first, gravity comp turns off instantly and the arms drop — support them.
+
+### Recording demonstrations
+
+Add `--record <dir>` to any teleop command to enable data collection:
+
+```bash
+# Right arm with recording
+.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --gripper --record demos/
+
+# Both arms with recording
+.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --second-config deployment/config_left.yaml --gripper --record demos/
+```
+
+Click the **joystick** on either controller to start recording. Click again to stop and save. Each segment is saved as an HDF5 file (`demo_YYYYMMDD_HHMMSS.hdf5`). Parking (B/Y) also saves any in-progress recording.
+
+Inspect a recording:
+
+```bash
+.venv/bin/python -m deployment.inspect_demo demos/demo_20260916_143022.hdf5
+```
+
+#### What gets recorded
+
+The recorder (`deployment/recorder.py`) captures a complete snapshot of every signal in the system at the control loop rate (~100 Hz). Writing is decoupled from the loop — `tick()` appends to plain lists (cheap), `detach()` swaps them out in O(1), and `write_snapshot()` serializes to HDF5 on a background thread so the control loop never stalls.
+
+Each HDF5 file contains per-arm datasets (keyed by hand: `/right/...`, `/left/...`):
+
+| Dataset | Shape | Description |
+|---------|-------|-------------|
+| `joint_position` | (N, 6) | Measured joint angles [rad] |
+| `joint_velocity` | (N, 6) | Measured joint velocities [rad/s] |
+| `joint_target` | (N, 6) | Commanded joint targets [rad] |
+| `gripper_position` | (N,) | Measured gripper opening [0-1] |
+| `gripper_command` | (N,) | Commanded gripper target [0-1] |
+| `ee_position` | (N, 3) | End-effector position [m] |
+| `ee_quaternion` | (N, 4) | End-effector orientation [xyzw] |
+| `controller_position` | (N, 3) | Quest controller position [m] |
+| `controller_quaternion` | (N, 4) | Quest controller orientation [xyzw] |
+| `controller_trigger` | (N,) | Trigger value [0-1] |
+| `controller_grip` | (N,) | Grip value [0-1] |
+| `controller_clutch` | (N,) | Clutch engaged [0/1] |
+
+Plus session-level data: `/timestamps` (N,) seconds since first tick, `/mode` (N,) session mode per tick, and file-level attrs (`start_time`, `hz`, `arms`, `num_ticks`, `duration_s`).
+
+### Live dashboard
+
+Add `--dashboard` to any teleop command to launch a live web dashboard:
+
+```bash
+# Default port 8080
+.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --record demos/ --dashboard
+
+# Custom port
+.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --dashboard 9090
+```
+
+Open `http://localhost:8080` (or your custom port) in a browser. The dashboard uses Server-Sent Events (SSE) to stream data at ~10 Hz with zero external dependencies — just Python stdlib `http.server`.
+
+**What you see:**
+
+- **Recording status** — pulsing red REC indicator with timer and tick count, or dim IDLE with instructions
+- **Session card** — mode badge (idle/engaged/parked/fault), loop Hz, arm count, connected browser clients
+- **Per-arm cards** — 6 joint position bars (orange = pinned joint), position vs target values, gripper bar, end-effector XYZ, controller XYZ/trigger/grip, hand/tray travel vectors, lag in mm
+- **Saved demos** — auto-refreshing list of HDF5 files with duration, ticks, arms, file size
+
+Multiple browser tabs can connect simultaneously. The `_Broker` fan-out pattern drops stale frames rather than blocking the control loop, so the dashboard never interferes with arm control.
 
 ## Architecture
 ```
@@ -148,6 +215,8 @@ Releasing the clutch freezes the arm. Re-pressing re-anchors without jumping —
 | `TeleopSession` | `quest_teleop.py` | State machine (idle/engaged/homing/parked/fault) over one or two `ArmChannel`s. Single loop, single clock. |
 | `I2rtArm` | `robot.py` | Real hardware backend. Claims the CAN bus (fcntl lock + USB serial verification), wraps `get_yam_robot(zero_gravity_mode=True)`. |
 | `SimArm` | `robot.py` | i2rt's MuJoCo `SimRobot` — same `Robot` protocol as hardware. Preferred for development. |
+| `DemoRecorder` | `recorder.py` | Appends per-tick data to in-memory buffers. `detach()` hands off a snapshot for background HDF5 writing. |
+| `Dashboard` | `dashboard.py` | SSE server for live telemetry. `push(snapshot)` fans out to all connected browsers via `_Broker`. |
 
 ### Files
 
@@ -155,12 +224,17 @@ Releasing the clutch freezes the arm. Re-pressing re-anchors without jumping —
 deployment/
   quest_teleop.py    Main teleop script (QuestReader, TeleopIK, TrayTarget, ArmChannel, TeleopSession)
   robot.py           Arm backends: I2rtArm (CAN), SimArm (MuJoCo), MockArm (first-order servo)
+  recorder.py        HDF5 demonstration recorder (DemoRecorder, write_snapshot)
+  dashboard.py       Live SSE dashboard server (Dashboard, _Broker, zero deps)
+  dashboard.html     Single-page dashboard UI (dark theme, dynamic arm cards)
+  inspect_demo.py    CLI tool to inspect recorded HDF5 demos
   config.py          YAML config loader with validation
   config.yaml        Right arm config (hand, channel, backend, safety limits, tuning)
   config_left.yaml   Left arm config
   preflight.py       Pre-flight checks for real hardware
   camera.py          One Euro filter implementation
   calibration/       Saved operator frame calibration files
+  record_pose.py     Hand-guide a pose and save it
 balancing_act/
   assets.py          Reset pose loader (yam_home.json)
 ```
@@ -209,6 +283,5 @@ The configs ship with the correct CAN adapter serials and channel mappings for o
 
 ## Known gaps
 
-- **No recording.** Nothing writes demonstration data yet.
-- **No cameras.** `camera.py` is just the One Euro filter.
+- **No cameras.** `camera.py` is just the One Euro filter. No camera feed into the headset yet.
 - **No collision checking.** The operator joint box is the only thing keeping arms apart.

@@ -56,6 +56,8 @@ from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 from balancing_act.assets import YAM_ARM_HOME_JOINT_POS, YAM_ARM_HOME_VERIFIED
 from deployment.camera import OneEuroFilter
 from deployment.config import load_deployment_config, validate_config
+from deployment.dashboard import Dashboard
+from deployment.recorder import DemoRecorder, DemoSnapshot, write_snapshot
 from deployment.robot import ArmState, make_arm
 
 # The headset app, its log tag, and where to get it. The app is `oculus_reader`'s
@@ -1026,6 +1028,8 @@ class TeleopSession:
     backend: str | None = None,
     frame: np.ndarray | None = None,
     extra: list[tuple[dict, np.ndarray | None]] | None = None,
+    record_dir: Path | None = None,
+    dashboard_port: int | None = None,
   ):
     validate_config(config)
     teleop = config["teleop"]
@@ -1063,8 +1067,18 @@ class TeleopSession:
     self._print_period_s = 0.0 if print_hz <= 0.0 else 1.0 / print_hz
     self._last_print_s = 0.0
 
+    self._record_dir = record_dir
+    self._recorder = DemoRecorder(hands=hands, hz=1.0 / self._period_s) if record_dir else None
+    self._writers: list[threading.Thread] = []
+
+    self._dashboard: Dashboard | None = None
+    if dashboard_port is not None:
+      self._dashboard = Dashboard(port=dashboard_port, record_dir=record_dir)
+      self._dashboard.start()
+    self._last_dashboard_push_s = 0.0
+
     self._lock = threading.Lock()
-    self._button_edges = {hand: {"home": True, "stop": False} for hand in hands}
+    self._button_edges = {hand: {"home": True, "stop": False, "js_click": False} for hand in hands}
     self._mode = IDLE
     self._fault: str | None = None
     self._note = "holding current position; release clutch before engaging"
@@ -1106,6 +1120,10 @@ class TeleopSession:
         channel.close()
       except Exception as exc:
         errors.append(str(exc))
+    # After the motors are safe: a driver fault must not cost the demo.
+    self._finish_recording()
+    if self._dashboard is not None:
+      self._dashboard.close()
     if errors:
       raise RuntimeError("Driver shutdown failed; use emergency stop: " + "; ".join(errors))
     self._closed = True
@@ -1158,6 +1176,11 @@ class TeleopSession:
       for channel, target in zip(self._channels, targets):
         channel.command(target)
 
+      if self._recorder is not None:
+        with self._lock:
+          mode = self._mode
+        self._recorder.tick(states, targets, samples, self._channels, mode, now)
+
       tick = time.perf_counter()
       period = max(tick - last, 1.0e-6)
       last = tick
@@ -1168,6 +1191,7 @@ class TeleopSession:
         alpha = min(1.0, self._period_s / 0.5)
         self._measured_hz = (1.0 - alpha) * self._measured_hz + alpha / period
       self._maybe_print(samples, now)
+      self._maybe_push_dashboard(samples, targets, now)
 
       next_tick += self._period_s
       sleep_s = next_tick - time.perf_counter()
@@ -1178,24 +1202,41 @@ class TeleopSession:
         next_tick = time.perf_counter()
 
   def _apply_buttons(self, sample: ControllerSample) -> None:
-    """B/Y pauses. A/X resumes a deliberate pause, never a fault."""
+    """B/Y pauses. A/X resumes a deliberate pause, never a fault.
+    Joystick click toggles recording (when --record is active)."""
     if time.monotonic() - sample.received_s > self._watchdog_s:
       return
+    js_key = "RJ" if sample.hand == "right" else "LJ"
+    js_pressed = bool(sample.buttons.get(js_key, False))
     with self._lock:
       edges = self._button_edges[sample.hand]
       stop = sample.stop and not edges["stop"]
       resume = sample.home and not edges["home"]
-      edges.update(stop=sample.stop, home=sample.home)
+      js_click = js_pressed and not edges["js_click"]
+      edges.update(stop=sample.stop, home=sample.home, js_click=js_pressed)
       if stop:
         self._mode = FAULT if self._fault else PARKED
         self._note = "paused; A/X resumes, then release and press clutch"
         for channel in self._channels:
           channel.release_input()
           channel.hold = channel._last_command.copy()
+        if self._recorder is not None and self._recorder.recording:
+          self._save_recording()
       elif resume and self._mode == PARKED and self._fault is None:
         self._mode = IDLE
         for channel in self._channels:
           channel.release_input()
+      if js_click and self._recorder is not None:
+        if self._recorder.recording:
+          self._save_recording()
+        elif self._mode in {PARKED, FAULT}:
+          # Parking already saved whatever was running; starting again here
+          # would only capture a stationary arm.
+          self._note = "resume with A/X before recording"
+        else:
+          self._recorder.start()
+          self._note = "RECORDING started (joystick click to stop)"
+          print("\n*** RECORDING STARTED ***", flush=True)
 
   def _step(
     self,
@@ -1259,6 +1300,55 @@ class TeleopSession:
       self._mode = ENGAGED if any_engaged else IDLE
       return targets
 
+  # --------------------------------------------------------- recording helpers
+
+  def _save_recording(self) -> None:
+    """Detach the buffer and write it off the control thread.
+
+    Writing a demo takes tens to hundreds of milliseconds and grows with its
+    length; doing it here would stall the loop for whole control periods and
+    can trip the follow check on the next tick. `detach` is O(1), so only the
+    handoff happens on this thread. Caller holds self._lock.
+    """
+    if self._recorder is None:
+      return
+    snapshot = self._recorder.detach()
+    if snapshot is None:
+      self._note = "recording discarded (nothing captured)"
+      print("\n*** RECORDING DISCARDED (empty) ***", flush=True)
+      return
+    self._writers = [thread for thread in self._writers if thread.is_alive()]
+    writer = threading.Thread(
+      target=self._write_snapshot, args=(snapshot,), name="demo-writer", daemon=False
+    )
+    self._writers.append(writer)
+    writer.start()
+    self._note = f"saving {snapshot.num_ticks} ticks"
+
+  def _write_snapshot(self, snapshot: DemoSnapshot) -> None:
+    """Runs on a writer thread, never on the control loop."""
+    try:
+      path = write_snapshot(snapshot, self._record_dir)
+      print(
+        f"\n*** RECORDING SAVED: {path.name} "
+        f"({snapshot.num_ticks} ticks, {snapshot.duration_s:.1f}s) ***",
+        flush=True,
+      )
+    except Exception as exc:
+      print(f"\n*** RECORDING SAVE FAILED: {exc} ***", flush=True)
+
+  def _finish_recording(self) -> None:
+    """Flush an in-progress recording and wait for pending writes. Called
+    once the control thread has stopped, so detaching needs no lock."""
+    if self._recorder is None:
+      return
+    snapshot = self._recorder.detach()
+    if snapshot is not None:
+      self._write_snapshot(snapshot)
+    for writer in self._writers:
+      writer.join(timeout=60.0)
+    self._writers.clear()
+
   # ------------------------------------------------------------ moves/console
 
   def _begin_move(self, mode: str, targets: list[np.ndarray]) -> None:
@@ -1308,9 +1398,58 @@ class TeleopSession:
         line += f" lag={arm['lag_mm']:3.0f}mm"
       if arm["pinned"]:
         line += " pinned=j" + ",j".join(str(index) for index in arm["pinned"])
+    if self._recorder is not None:
+      if self._recorder.recording:
+        ticks = self._recorder.tick_count
+        secs = ticks * self._period_s
+        line += f"  [REC {secs:.0f}s]"
+      else:
+        line += "  [js=rec]"
     if status["fault"]:
       line += f"  FAULT: {status['fault']}"
     _emit(line)
+
+  def _maybe_push_dashboard(
+    self,
+    samples: dict[str, ControllerSample | None],
+    targets: list[np.ndarray],
+    now: float,
+  ) -> None:
+    if self._dashboard is None:
+      return
+    # ~10 Hz to the browser — no need for 100 Hz visual updates.
+    if now - self._last_dashboard_push_s < 0.1:
+      return
+    self._last_dashboard_push_s = now
+    with self._lock:
+      status = {
+        "mode": self._mode,
+        "fault": self._fault,
+        "note": self._note,
+        "hz": round(self._measured_hz, 1),
+        "dashboard_clients": self._dashboard.client_count,
+        "arms": [],
+        "controller_samples": {},
+        "recording": {
+          "active": self._recorder.recording if self._recorder else False,
+          "ticks": self._recorder.tick_count if self._recorder else 0,
+          "duration_s": round(self._recorder.tick_count * self._period_s, 1) if self._recorder else 0,
+        },
+      }
+      for i, channel in enumerate(self._channels):
+        arm_status = channel.status()
+        arm_status["targets"] = targets[i].tolist() if i < len(targets) else []
+        status["arms"].append(arm_status)
+        sample = samples.get(channel.hand)
+        if sample is not None:
+          status["controller_samples"][channel.hand] = {
+            "position": sample.position.tolist(),
+            "quat": sample.quat.tolist(),
+            "trigger": float(sample.trigger),
+            "grip": float(sample.grip),
+            "clutch": bool(sample.clutch),
+          }
+    self._dashboard.push(status)
 
 
 def _emit(line: str) -> None:
@@ -1513,6 +1652,29 @@ def main() -> None:
       "motion drive the tray along the axes you expect."
     ),
   )
+  parser.add_argument(
+    "--record",
+    type=Path,
+    default=None,
+    metavar="DIR",
+    help=(
+      "Record demonstration data to HDF5 files in DIR. Recording starts/stops "
+      "with the right joystick click. Each segment saves automatically."
+    ),
+  )
+  parser.add_argument(
+    "--dashboard",
+    type=int,
+    nargs="?",
+    const=8080,
+    default=None,
+    metavar="PORT",
+    help=(
+      "Start a live web dashboard on PORT (default 8080). Open "
+      "http://localhost:PORT in a browser to see joint angles, EE position, "
+      "controller state, recording status and saved demos."
+    ),
+  )
   args = parser.parse_args()
 
   config = load_deployment_config(args.config)
@@ -1614,7 +1776,7 @@ def main() -> None:
       if sample is None or time.monotonic() - sample.received_s > float(teleop["watchdog_s"]):
         raise RuntimeError("Fresh controller input is required before opening an arm")
     try:
-      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra)
+      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra, record_dir=args.record, dashboard_port=args.dashboard)
     except Exception as exc:
       backend = args.backend or config["robot"]["backend"]
       if backend == "i2rt":
@@ -1637,7 +1799,12 @@ def main() -> None:
       print("grip button clutches, trigger drives the gripper (squeeze to close).")
     else:
       print("trigger (or grip) drives the arm.")
-    print("B/Y pauses both arms; A/X resumes. Release and press clutch to engage.\nSupport both arms before Ctrl-C: exiting disables motors.\n")
+    print("B/Y pauses both arms; A/X resumes. Release and press clutch to engage.")
+    if args.record:
+      print(f"Recording to {args.record}/. Click joystick to start/stop recording.")
+    if args.dashboard:
+      print(f"Dashboard: http://localhost:{args.dashboard}")
+    print("Support both arms before Ctrl-C: exiting disables motors.\n")
     session.start()
     try:
       while session.alive():
@@ -1648,6 +1815,8 @@ def main() -> None:
     except KeyboardInterrupt:
       print("\nclosing drivers; arms must be supported.", flush=True)
     finally:
+      # close() stops the loop, closes the drivers, then flushes any
+      # in-progress recording and waits for pending writes.
       session.close()
     if session.status()["fault"]:
       raise RuntimeError(session.status()["fault"])

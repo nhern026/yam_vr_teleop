@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>YAM Teleop Dashboard</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --surface2: #334155;
+    --border: #475569;
+    --text: #f1f5f9;
+    --text-dim: #94a3b8;
+    --accent: #3b82f6;
+    --green: #22c55e;
+    --red: #ef4444;
+    --orange: #f97316;
+    --yellow: #eab308;
+    --purple: #a78bfa;
+    --font: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    padding: 16px;
+    min-height: 100vh;
+  }
+  h1 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  h1 .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--red);
+    flex-shrink: 0;
+  }
+  h1 .status-dot.connected { background: var(--green); }
+  h1 .hz { font-size: 12px; color: var(--text-dim); font-weight: 400; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .grid.three { grid-template-columns: 1fr 1fr 1fr; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .card h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .card.full { grid-column: 1 / -1; }
+
+  /* Recording status */
+  .rec-status {
+    text-align: center;
+    padding: 20px 12px;
+  }
+  .rec-status .indicator {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: 2px;
+  }
+  .rec-status .indicator.recording {
+    color: var(--red);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  .rec-status .indicator.idle { color: var(--text-dim); }
+  .rec-status .timer {
+    font-size: 18px;
+    color: var(--text);
+    margin-top: 4px;
+  }
+  .rec-status .ticks {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* Mode */
+  .mode-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .mode-idle { background: var(--surface2); color: var(--text-dim); }
+  .mode-engaged { background: #14532d; color: var(--green); }
+  .mode-parked { background: #422006; color: var(--orange); }
+  .mode-fault { background: #450a0a; color: var(--red); }
+  .mode-homing, .mode-returning { background: #1e1b4b; color: var(--purple); }
+
+  /* Joint display */
+  .joint-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--surface2);
+  }
+  .joint-row:last-child { border-bottom: none; }
+  .joint-label {
+    width: 28px;
+    font-weight: 600;
+    color: var(--text-dim);
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+  .joint-bar-bg {
+    flex: 1;
+    height: 14px;
+    background: var(--surface2);
+    border-radius: 3px;
+    position: relative;
+    overflow: hidden;
+  }
+  .joint-bar {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: left 0.08s, width 0.08s;
+    min-width: 2px;
+  }
+  .joint-bar.pinned { background: var(--orange); }
+  .joint-val {
+    width: 58px;
+    text-align: right;
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+  .joint-target {
+    width: 58px;
+    text-align: right;
+    font-size: 11px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  /* EE / controller readout */
+  .readout {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 10px;
+    font-size: 12px;
+  }
+  .readout .key { color: var(--text-dim); }
+  .readout .val { font-variant-numeric: tabular-nums; }
+
+  /* Gripper */
+  .gripper-bar-bg {
+    width: 100%;
+    height: 20px;
+    background: var(--surface2);
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+    margin-top: 6px;
+  }
+  .gripper-bar {
+    height: 100%;
+    background: var(--green);
+    border-radius: 4px;
+    transition: width 0.08s;
+  }
+  .gripper-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  /* Demo list */
+  .demo-list {
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .demo-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--surface2);
+    font-size: 12px;
+  }
+  .demo-item:last-child { border-bottom: none; }
+  .demo-item .name { color: var(--accent); }
+  .demo-item .meta { color: var(--text-dim); }
+  .no-demos { color: var(--text-dim); font-style: italic; font-size: 12px; }
+
+  /* Note bar */
+  .note-bar {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+  }
+  .note-bar .fault { color: var(--red); font-weight: 600; }
+
+  /* Controller section */
+  .controller-section { margin-top: 6px; }
+  .controller-section h3 {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    letter-spacing: 0.5px;
+  }
+
+  .arm-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .arm-header .arm-label {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .clutch-badge {
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .clutch-on { background: #14532d; color: var(--green); }
+  .clutch-off { background: var(--surface2); color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<h1>
+  <span class="status-dot" id="connDot"></span>
+  YAM Teleop
+  <span class="hz" id="hzLabel">-- Hz</span>
+  <span class="hz" id="connLabel" style="margin-left:auto">connecting...</span>
+</h1>
+
+<div class="note-bar" id="noteBar">Waiting for teleop session...</div>
+
+<div class="grid">
+  <!-- Recording status -->
+  <div class="card rec-status" id="recCard">
+    <div class="indicator idle" id="recIndicator">IDLE</div>
+    <div class="timer" id="recTimer"></div>
+    <div class="ticks" id="recTicks">joystick click to record</div>
+  </div>
+
+  <!-- Mode + global -->
+  <div class="card">
+    <h2>Session</h2>
+    <div class="readout">
+      <span class="key">Mode</span>
+      <span class="val"><span class="mode-badge mode-idle" id="modeBadge">--</span></span>
+      <span class="key">Loop</span>
+      <span class="val" id="loopHz">-- Hz</span>
+      <span class="key">Arms</span>
+      <span class="val" id="armCount">--</span>
+      <span class="key">Clients</span>
+      <span class="val" id="clientCount">--</span>
+    </div>
+  </div>
+</div>
+
+<!-- Arms — populated dynamically -->
+<div id="armsContainer"></div>
+
+<!-- Saved demos -->
+<div class="card full" style="margin-top:12px">
+  <h2>Saved Demos <span id="demoCount" style="color:var(--accent)"></span></h2>
+  <div class="demo-list" id="demoList">
+    <div class="no-demos">No demos yet</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// --- SSE connection ---
+let evtSource = null;
+let lastData = null;
+let reconnectTimer = null;
+
+function connect() {
+  if (evtSource) { try { evtSource.close(); } catch(e) {} }
+  evtSource = new EventSource('/events');
+  evtSource.onopen = () => {
+    $('connDot').classList.add('connected');
+    $('connLabel').textContent = 'connected';
+  };
+  evtSource.onmessage = (e) => {
+    try {
+      lastData = JSON.parse(e.data);
+      render(lastData);
+    } catch(err) {}
+  };
+  evtSource.onerror = () => {
+    $('connDot').classList.remove('connected');
+    $('connLabel').textContent = 'reconnecting...';
+    evtSource.close();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+}
+
+// --- Rendering ---
+const armCards = {};
+
+function ensureArmCards(arms) {
+  const container = $('armsContainer');
+  const needed = arms.map(a => a.label || a.hand);
+  // Remove stale
+  for (const key of Object.keys(armCards)) {
+    if (!needed.includes(key)) {
+      armCards[key].remove();
+      delete armCards[key];
+    }
+  }
+  // Create missing
+  for (const arm of arms) {
+    const key = arm.label || arm.hand;
+    if (!armCards[key]) {
+      const div = document.createElement('div');
+      div.className = 'grid';
+      div.innerHTML = buildArmHTML(key);
+      container.appendChild(div);
+      armCards[key] = div;
+    }
+  }
+}
+
+function buildArmHTML(label) {
+  const id = label.replace(/[^a-zA-Z0-9]/g, '_');
+  let joints = '';
+  for (let i = 1; i <= 6; i++) {
+    joints += `
+      <div class="joint-row">
+        <span class="joint-label">J${i}</span>
+        <div class="joint-bar-bg"><div class="joint-bar" id="${id}_bar_${i}"></div></div>
+        <span class="joint-val" id="${id}_pos_${i}">--</span>
+        <span class="joint-target" id="${id}_tgt_${i}">--</span>
+      </div>`;
+  }
+  return `
+    <div class="card">
+      <div class="arm-header">
+        <span class="arm-label">${label.toUpperCase()}</span>
+        <span class="clutch-badge clutch-off" id="${id}_clutch">IDLE</span>
+      </div>
+      <h2>Joint Positions (pos / target)</h2>
+      ${joints}
+      <div style="margin-top:8px">
+        <h2>Gripper</h2>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:12px;color:var(--text-dim)">Cmd:</span>
+          <span style="font-size:14px;font-weight:600" id="${id}_gripper_val">--</span>
+        </div>
+        <div class="gripper-bar-bg"><div class="gripper-bar" id="${id}_gripper_bar"></div></div>
+        <div class="gripper-labels"><span>Closed</span><span>Open</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>End Effector</h2>
+      <div class="readout">
+        <span class="key">X</span><span class="val" id="${id}_ee_x">--</span>
+        <span class="key">Y</span><span class="val" id="${id}_ee_y">--</span>
+        <span class="key">Z</span><span class="val" id="${id}_ee_z">--</span>
+      </div>
+      <div class="controller-section">
+        <h3>Controller</h3>
+        <div class="readout">
+          <span class="key">X</span><span class="val" id="${id}_ctrl_x">--</span>
+          <span class="key">Y</span><span class="val" id="${id}_ctrl_y">--</span>
+          <span class="key">Z</span><span class="val" id="${id}_ctrl_z">--</span>
+          <span class="key">Trigger</span><span class="val" id="${id}_trigger">--</span>
+          <span class="key">Grip</span><span class="val" id="${id}_grip">--</span>
+        </div>
+      </div>
+      <div class="controller-section">
+        <h3>Travel</h3>
+        <div class="readout">
+          <span class="key">Hand</span><span class="val" id="${id}_hand_travel">--</span>
+          <span class="key">Tray</span><span class="val" id="${id}_tray_travel">--</span>
+          <span class="key">Lag</span><span class="val" id="${id}_lag">--</span>
+          <span class="key">Pinned</span><span class="val" id="${id}_pinned">--</span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function render(d) {
+  // Mode
+  const mode = d.mode || '--';
+  const badge = $('modeBadge');
+  badge.textContent = mode.toUpperCase();
+  badge.className = 'mode-badge mode-' + mode;
+
+  // Hz
+  $('loopHz').textContent = (d.hz || 0).toFixed(1) + ' Hz';
+  $('hzLabel').textContent = (d.hz || 0).toFixed(0) + ' Hz';
+  $('armCount').textContent = (d.arms || []).length;
+  $('clientCount').textContent = d.dashboard_clients || '--';
+
+  // Note
+  const note = $('noteBar');
+  if (d.fault) {
+    note.innerHTML = '<span class="fault">FAULT: ' + esc(d.fault) + '</span>';
+  } else {
+    note.textContent = d.note || '';
+  }
+
+  // Recording
+  const rec = d.recording || {};
+  const recInd = $('recIndicator');
+  if (rec.active) {
+    recInd.textContent = 'REC';
+    recInd.className = 'indicator recording';
+    $('recTimer').textContent = formatTime(rec.duration_s || 0);
+    $('recTicks').textContent = (rec.ticks || 0) + ' ticks';
+    $('recCard').style.borderColor = 'var(--red)';
+  } else {
+    recInd.textContent = 'IDLE';
+    recInd.className = 'indicator idle';
+    $('recTimer').textContent = '';
+    $('recTicks').textContent = 'joystick click to record';
+    $('recCard').style.borderColor = '';
+  }
+
+  // Arms
+  const arms = d.arms || [];
+  ensureArmCards(arms);
+  for (const arm of arms) {
+    renderArm(arm, d.controller_samples || {});
+  }
+}
+
+function renderArm(arm, samples) {
+  const label = arm.label || arm.hand;
+  const id = label.replace(/[^a-zA-Z0-9]/g, '_');
+  const joints = arm.joints || [];
+  const targets = arm.targets || [];
+  const pinned = arm.pinned || [];
+
+  // Clutch badge
+  const clutch = document.getElementById(id + '_clutch');
+  if (clutch) {
+    if (arm.engaged) {
+      clutch.textContent = 'ENGAGED';
+      clutch.className = 'clutch-badge clutch-on';
+    } else {
+      clutch.textContent = 'IDLE';
+      clutch.className = 'clutch-badge clutch-off';
+    }
+  }
+
+  // Joints — range roughly -3.14 to 3.14
+  for (let i = 0; i < 6; i++) {
+    const ji = i + 1;
+    const pos = joints[i] ?? 0;
+    const tgt = targets[i] ?? null;
+    const bar = document.getElementById(id + '_bar_' + ji);
+    const posEl = document.getElementById(id + '_pos_' + ji);
+    const tgtEl = document.getElementById(id + '_tgt_' + ji);
+    if (bar) {
+      // Map -pi..pi to 0..100%
+      const pct = ((pos + Math.PI) / (2 * Math.PI)) * 100;
+      bar.style.left = Math.min(pct, 50) + '%';
+      bar.style.width = Math.abs(pct - 50) + '%';
+      bar.className = pinned.includes(ji) ? 'joint-bar pinned' : 'joint-bar';
+    }
+    if (posEl) posEl.textContent = pos.toFixed(3);
+    if (tgtEl) tgtEl.textContent = tgt !== null ? tgt.toFixed(3) : '--';
+  }
+
+  // Gripper
+  const gripVal = arm.gripper;
+  const gripEl = document.getElementById(id + '_gripper_val');
+  const gripBar = document.getElementById(id + '_gripper_bar');
+  if (gripEl) gripEl.textContent = gripVal !== null && gripVal !== undefined ? gripVal.toFixed(2) : '--';
+  if (gripBar) gripBar.style.width = (gripVal !== null && gripVal !== undefined ? gripVal * 100 : 0) + '%';
+
+  // EE
+  const tray = arm.tray || [0, 0, 0];
+  setText(id + '_ee_x', tray[0]?.toFixed(4));
+  setText(id + '_ee_y', tray[1]?.toFixed(4));
+  setText(id + '_ee_z', tray[2]?.toFixed(4));
+
+  // Controller
+  const sample = samples[arm.hand];
+  if (sample) {
+    const cp = sample.position || [0, 0, 0];
+    setText(id + '_ctrl_x', cp[0]?.toFixed(4));
+    setText(id + '_ctrl_y', cp[1]?.toFixed(4));
+    setText(id + '_ctrl_z', cp[2]?.toFixed(4));
+    setText(id + '_trigger', (sample.trigger ?? 0).toFixed(2));
+    setText(id + '_grip', (sample.grip ?? 0).toFixed(2));
+  }
+
+  // Travel
+  const ht = arm.hand_travel || [0, 0, 0];
+  const tt = arm.tray_travel || [0, 0, 0];
+  setText(id + '_hand_travel', `(${ht[0]?.toFixed(3)}, ${ht[1]?.toFixed(3)}, ${ht[2]?.toFixed(3)})`);
+  setText(id + '_tray_travel', `(${tt[0]?.toFixed(3)}, ${tt[1]?.toFixed(3)}, ${tt[2]?.toFixed(3)})`);
+  setText(id + '_lag', (arm.lag_mm || 0).toFixed(1) + ' mm');
+  setText(id + '_pinned', pinned.length ? pinned.map(j => 'J' + j).join(', ') : 'none');
+}
+
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val || '--';
+}
+
+function formatTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m.toString().padStart(2, '0') + ':' + sec.toString().padStart(2, '0');
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- Demo list polling ---
+function fetchDemos() {
+  fetch('/demos')
+    .then(r => r.json())
+    .then(demos => {
+      const list = $('demoList');
+      $('demoCount').textContent = demos.length ? `(${demos.length})` : '';
+      if (!demos.length) {
+        list.innerHTML = '<div class="no-demos">No demos yet</div>';
+        return;
+      }
+      list.innerHTML = demos.map(d => `
+        <div class="demo-item">
+          <span class="name">${esc(d.name)}</span>
+          <span class="meta">${d.duration_s || '?'}s &middot; ${d.ticks || '?'} ticks &middot; ${(d.arms || []).join(', ')} &middot; ${d.size_kb || '?'} KB</span>
+        </div>`).join('');
+    })
+    .catch(() => {});
+}
+
+// --- Init ---
+connect();
+fetchDemos();
+setInterval(fetchDemos, 5000);
+</script>
+</body>
+</html>

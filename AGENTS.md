@@ -1,0 +1,124 @@
+# AGENTS.md
+
+Agent handoff document for the `yam_vr_teleop` project. Read this first.
+
+## What this is
+
+VR teleoperation for YAM 6-DOF robot arms using Meta Quest 3 controllers. One or two arms in a single process, driven by Quest controllers over USB (`adb logcat`). The operator holds grip to clutch, moves their hand, and the arm follows via IK. Data collection records everything to HDF5 at 100 Hz.
+
+## Environment
+
+```bash
+# Python venv (NOT uv-managed — uses requirements.txt)
+cd /home/nico/yam_teleop
+source .venv/bin/activate
+
+# Run teleop in sim (no hardware needed)
+.venv/bin/python -m deployment.quest_teleop --backend sim --gripper
+
+# Run with recording + live dashboard
+.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --record demos/ --dashboard
+
+# Inspect a recorded demo
+.venv/bin/python -m deployment.inspect_demo demos/<file>.hdf5
+```
+
+There is no test suite in this repo. Test by running `--backend sim` and checking behavior. The venv is at `/home/nico/yam_teleop/.venv/bin/python` — the system has `python3` but no `python` alias.
+
+## Dependencies
+
+- `requirements.txt` lists: numpy, mujoco, mink, quadprog, pyyaml, h5py
+- `i2rt` is installed separately (`uv pip install "i2rt @ git+https://github.com/i2rt-robotics/i2rt"` or editable from `/home/nico/i2rt`). i2rt provides the Robot protocol, motor drivers, MuJoCo sim, URDF/MJCF models, gravity comp. Even sim mode needs i2rt because IK builds from its MJCF.
+- No aiohttp, no websockets, no Flask — the dashboard uses only Python stdlib.
+
+## Architecture at a glance
+
+```
+Quest 3 (USB)
+  │  adb logcat (~70 Hz)
+  ▼
+QuestReader ──▶ ArmChannel ──▶ TeleopIK ──▶ I2rtArm (CAN) or SimArm (MuJoCo)
+                    │
+             TeleopSession (state machine: idle/engaged/homing/parked/fault)
+                    │
+              ┌─────┼──────┐
+              ▼     ▼      ▼
+          Recorder  Dashboard  Console print
+          (HDF5)    (SSE@10Hz) (stdout@10Hz)
+```
+
+Control loop runs at 100 Hz. Each tick: read joints → filter Quest pose → map hand motion to tray frame → solve IK (mink QP) → rate-limit and command joints.
+
+## Key files
+
+All code lives in `deployment/`:
+
+| File | What it does |
+|------|-------------|
+| `quest_teleop.py` | Everything: QuestReader, TeleopIK, TrayTarget, ArmChannel, TeleopSession, CLI main. ~1800 lines. |
+| `robot.py` | Arm backends: `I2rtArm` (real CAN hardware), `SimArm` (MuJoCo), `MockArm` (first-order servo). |
+| `recorder.py` | `DemoRecorder` appends per-tick data in-memory. `detach()` swaps buffers in O(1). `write_snapshot()` serializes to HDF5 on a background thread — never blocks the control loop. |
+| `dashboard.py` | `Dashboard` class runs an HTTP server on a background thread. SSE at `/events`, HTML at `/`, demo list at `/demos`. `_Broker` fans out from the teleop thread to N browser clients, dropping stale frames. Zero external deps (stdlib `http.server` + `socketserver.ThreadingMixIn`). |
+| `dashboard.html` | Single-page dark-theme dashboard. `EventSource('/events')` auto-reconnects. Dynamically creates arm cards for 1 or 2 arms. |
+| `config.py` | YAML loader with validation. |
+| `config.yaml` | Right arm config. |
+| `config_left.yaml` | Left arm config. |
+| `inspect_demo.py` | CLI to print contents of a recorded HDF5 demo. |
+| `preflight.py` | Hardware pre-flight checks (CAN, motors, limits). |
+| `camera.py` | One Euro filter (NOT a camera — just the filter math). |
+
+## Config structure (config.yaml)
+
+- **`teleop`**: `hand`, `control_hz`, `position_scale`, `max_tray_speed_m_s`, filter params, `watchdog_s`, `move_s`
+- **`robot`**: `backend` (i2rt/sim/mock), `channel` (can0/can1), `arm_type`, `gripper_type`, `adapter_serial`
+- **`safety`**: `max_command_velocity_rad_s`, `max_command_offset_rad`, `max_joint_velocity_rad_s`, `joint_position_min/max_rad`
+- **`deploy`**: `home_joint_position_rad`, `reset_joint_position_rad`
+
+## Data recording details
+
+HDF5 files at 100 Hz. Per-arm groups (`/right/`, `/left/`) each contain: `joint_position` (N,6), `joint_velocity` (N,6), `joint_target` (N,6), `gripper_position` (N,), `gripper_command` (N,), `ee_position` (N,3), `ee_quaternion` (N,4), `controller_position` (N,3), `controller_quaternion` (N,4), `controller_trigger` (N,), `controller_grip` (N,), `controller_clutch` (N,). Plus `/timestamps` (N,) and `/mode` (N,). File attrs: `start_time`, `hz`, `arms`, `num_ticks`, `duration_s`.
+
+Toggle recording with joystick click on either controller. Parking (B/Y) auto-saves.
+
+## Dashboard details
+
+- Served from a daemon thread alongside the control loop
+- SSE (Server-Sent Events) streams JSON snapshots at ~10 Hz (throttled from the 100 Hz loop)
+- `_Broker` pattern: one `publish()` call fans out to per-client queues; stale frames are dropped, dead clients are auto-removed
+- `_ReusableHTTPServer` = `ThreadingMixIn + HTTPServer` with `allow_reuse_address` and `daemon_threads`
+- `serve_forever()` + `shutdown()` for clean exit
+- Keepalive comments every 15s prevent browser SSE timeout
+- `/demos` endpoint reads HDF5 file attrs via h5py
+
+## CLI flags (quest_teleop.py)
+
+| Flag | Effect |
+|------|--------|
+| `--config <path>` | Primary arm config YAML |
+| `--second-config <path>` | Second arm for bimanual |
+| `--backend sim` | MuJoCo sim (no hardware) |
+| `--gripper` | Enable gripper control |
+| `--record <dir>` | Enable HDF5 recording to directory |
+| `--dashboard [PORT]` | Start live dashboard (default 8080) |
+| `--calibrate` | Calibrate operator frame and exit |
+| `--dump` | Print raw controller stream and exit |
+
+## Known issues and next steps
+
+- **Sensitivity too high**: `position_scale` (currently 1.0) and `max_tray_speed_m_s` (currently 0.5) need to be dialed back. The operator feels like small hand movements create large arm motions.
+- **Operator frame calibration**: Needs re-calibration with headset in actual operating position.
+- **No collision checking**: The operator joint box is the only thing preventing arm-arm or arm-table collisions.
+- **No cameras**: `camera.py` is just the One Euro filter. No camera feed into the headset.
+- **Dashboard is view-only**: No controls for starting/stopping recording from the browser yet.
+
+## i2rt dependency
+
+This project depends on the `i2rt` library at `/home/nico/i2rt` (or installed from GitHub). Key interfaces used:
+
+- `get_yam_robot(sim=True/False, ...)` — factory that returns a `Robot` (either `MotorChainRobot` or `SimRobot`)
+- `Robot` protocol: `get_joint_pos()`, `command_joint_pos()`, `get_observations()`, etc.
+- `ArmType` / `GripperType` enums from `i2rt.robots.utils`
+- `combine_arm_and_gripper_xml()` for merging arm + gripper MJCF at runtime
+- MuJoCo models under `i2rt/robot_models/`
+
+The i2rt repo has its own CLAUDE.md at `/home/nico/i2rt/CLAUDE.md` with full architecture docs.
