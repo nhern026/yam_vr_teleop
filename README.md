@@ -71,6 +71,11 @@ Add `--record <dir>` to record demos and `--dashboard` to launch a live browser 
 .venv/bin/python -m deployment.quest_teleop --backend sim --gripper --record demos/ --dashboard 9090
 ```
 
+```bash
+# Both arms with wrist cameras + recording + dashboard
+.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --second-config deployment/config_left.yaml --gripper --cameras --record demos/ --dashboard
+```
+
 Open `http://localhost:8080` (or your custom port) in a browser to see live joint angles, recording status, controller state, and saved demos.
 
 **Recording:** joystick click to start, joystick click to stop. Parking (B/Y) auto-saves. Each segment saves as `demos/demo_YYYYMMDD_HHMMSS.hdf5`.
@@ -78,6 +83,21 @@ Open `http://localhost:8080` (or your custom port) in a browser to see live join
 ```bash
 # Inspect a saved demo
 .venv/bin/python -m deployment.inspect_demo demos/demo_20260916_143022.hdf5
+```
+
+```bash
+# Export all demos to CSV (timestamp, 6 joints + gripper, targets)
+.venv/bin/python -m deployment.export_demos demos/ --csv out/csv
+```
+
+```bash
+# Export all demos to LeRobot v2.1 dataset (for XPolicyLab / pi0.5)
+.venv/bin/python -m deployment.export_demos demos/ --lerobot out/yam_teleop_dataset --fps 30
+```
+
+```bash
+# Export a single demo to both formats
+.venv/bin/python -m deployment.export_demos demos/demo_20260916_143022.hdf5 --csv out/csv --lerobot out/dataset
 ```
 
 ### Other commands
@@ -118,6 +138,7 @@ The gripper is proportional: squeezing the trigger halfway closes the gripper ha
 | `--backend sim` | MuJoCo sim (no hardware) |
 | `--gripper` | Enable gripper control |
 | `--record <dir>` | Enable HDF5 recording to directory |
+| `--cameras` | Enable wrist cameras (needs `cameras` section in config) |
 | `--dashboard [PORT]` | Start live dashboard (default 8080) |
 | `--calibrate` | Calibrate operator frame and exit |
 | `--dump` | Print raw controller stream and exit |

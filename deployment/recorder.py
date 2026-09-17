@@ -67,6 +67,8 @@ class DemoSnapshot:
     timestamps: list[float]
     modes: list[str]
     start_wall: str
+    camera_frames: dict[str, list[bytes]] = field(default_factory=dict)
+    camera_resolutions: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def num_ticks(self) -> int:
@@ -80,7 +82,7 @@ class DemoSnapshot:
 
 
 class DemoRecorder:
-    def __init__(self, hands: list[str], hz: float = 100.0):
+    def __init__(self, hands: list[str], hz: float = 100.0, camera_names: list[str] | None = None):
         self._hands = list(hands)
         self._hz = hz
         self._arms: dict[str, _ArmBuffer] = {h: _ArmBuffer() for h in hands}
@@ -88,6 +90,10 @@ class DemoRecorder:
         self._modes: list[str] = []
         self._start_wall: str | None = None
         self._recording = False
+        self._camera_names = list(camera_names or [])
+        self._camera_frames: dict[str, list[bytes]] = {n: [] for n in self._camera_names}
+        self._camera_resolutions: dict[str, tuple[int, int]] = {}
+        self._last_camera_seq: dict[str, int] = {n: -1 for n in self._camera_names}
 
     @property
     def recording(self) -> bool:
@@ -104,6 +110,36 @@ class DemoRecorder:
 
     def stop(self) -> None:
         self._recording = False
+
+    def tick_cameras(self, cameras: dict) -> None:
+        """Grab the latest frame from each camera and JPEG-encode it.
+
+        Called once per control tick. Skips cameras whose seq hasn't advanced
+        (the camera runs slower than the control loop). The recorder stores
+        one frame per tick at most; if the camera is slower we repeat the
+        previous frame to keep rows aligned with timestamps.
+        """
+        if not self._recording:
+            return
+        import cv2
+        for name in self._camera_names:
+            cam = cameras.get(name)
+            if cam is None:
+                self._camera_frames[name].append(b"")
+                continue
+            frame = cam.latest()
+            if frame is None:
+                self._camera_frames[name].append(b"")
+                continue
+            if name not in self._camera_resolutions:
+                self._camera_resolutions[name] = cam.resolution
+            if frame.seq == self._last_camera_seq.get(name, -1):
+                prev = self._camera_frames[name]
+                self._camera_frames[name].append(prev[-1] if prev else b"")
+                continue
+            self._last_camera_seq[name] = frame.seq
+            ok, buf = cv2.imencode(".jpg", frame.image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            self._camera_frames[name].append(buf.tobytes() if ok else b"")
 
     def tick(
         self,
@@ -169,12 +205,16 @@ class DemoRecorder:
             timestamps=self._timestamps,
             modes=self._modes,
             start_wall=self._start_wall or "",
+            camera_frames=self._camera_frames,
+            camera_resolutions=dict(self._camera_resolutions),
         )
         # Fresh containers: the snapshot owns the old ones from here.
         self._arms = {h: _ArmBuffer() for h in self._hands}
         self._timestamps = []
         self._modes = []
         self._start_wall = None
+        self._camera_frames = {n: [] for n in self._camera_names}
+        self._last_camera_seq = {n: -1 for n in self._camera_names}
         return snapshot
 
     def save(self, demo_dir: str | Path) -> Path:
@@ -191,6 +231,8 @@ class DemoRecorder:
         self._modes = []
         self._start_wall = None
         self._recording = False
+        self._camera_frames = {n: [] for n in self._camera_names}
+        self._last_camera_seq = {n: -1 for n in self._camera_names}
 
 
 def write_snapshot(snapshot: DemoSnapshot, demo_dir: str | Path) -> Path:
@@ -239,5 +281,21 @@ def write_snapshot(snapshot: DemoSnapshot, demo_dir: str | Path) -> Path:
             g.create_dataset("controller_trigger", data=np.array(buf.controller_trigger, dtype=np.float32))
             g.create_dataset("controller_grip", data=np.array(buf.controller_grip, dtype=np.float32))
             g.create_dataset("controller_clutch", data=np.array(buf.controller_clutch, dtype=np.int8))
+
+        for cam_name, frames in snapshot.camera_frames.items():
+            if not frames:
+                continue
+            vlen_dt = h5py.special_dtype(vlen=np.uint8)
+            g = f.create_group(f"cameras/{cam_name}")
+            ds = g.create_dataset("frames", shape=(len(frames),), dtype=vlen_dt)
+            for i, jpg in enumerate(frames):
+                if jpg:
+                    ds[i] = np.frombuffer(jpg, dtype=np.uint8)
+                else:
+                    ds[i] = np.zeros(0, dtype=np.uint8)
+            res = snapshot.camera_resolutions.get(cam_name, (0, 0))
+            g.attrs["width"] = res[0]
+            g.attrs["height"] = res[1]
+            g.attrs["codec"] = "jpeg"
 
     return path

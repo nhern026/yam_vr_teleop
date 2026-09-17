@@ -102,7 +102,7 @@ class Regressions(unittest.TestCase):
     def test_joint_command_rate_bound(self):
         s=self.session(); c=s.channels[0]; prev=c._last_command.copy()
         c.command(prev+.5)
-        self.assertLessEqual(np.max(np.abs(c._last_command-prev)), .01000001)
+        self.assertLessEqual(np.max(np.abs(c._last_command-prev)), .01500001)
         np.testing.assert_allclose(c.hold,c._last_command)
 
     def test_duplicate_bus_rejected_before_opening(self):

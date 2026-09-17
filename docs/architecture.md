@@ -58,6 +58,40 @@ Each HDF5 file contains per-arm datasets (keyed by hand: `/right/...`, `/left/..
 
 Plus session-level data: `/timestamps` (N,) seconds since first tick, `/mode` (N,) session mode per tick, and file-level attrs (`start_time`, `hz`, `arms`, `num_ticks`, `duration_s`).
 
+When `--cameras` is enabled, each camera gets a group under `/cameras/<name>/`:
+
+| Dataset | Shape | Description |
+|---------|-------|-------------|
+| `frames` | (N,) vlen uint8 | JPEG-encoded frames, one per tick |
+
+Attributes: `width`, `height`, `codec` ("jpeg").
+
+### Exporting demos
+
+`deployment/export_demos.py` converts HDF5 demos to training-friendly formats.
+
+**CSV** exports the full proprioception: joint positions (6) + joint velocities (6) + gripper (1) = 13-dim state, plus 7-dim action (joint targets + gripper command), at the native 100 Hz.
+
+**LeRobot v2.1** exports the XPolicyLab-canonical 7-dim state (joint positions + gripper) and 7-dim action (joint targets + gripper command). State and action share physical dimensions, which enables relative-action mode. For bimanual demos, both arms are concatenated (14D state, 14D action). The `--fps` flag resamples to camera rate (e.g. 30 Hz) so proprioception/actions align with image timestamps. When demos contain camera data, mp4 videos are written alongside the parquet files.
+
+**CSV** — one file per demo per arm at full 100 Hz. Columns: `timestamp, state_pos_j1..j6, state_vel_j1..j6, state_gripper, action_j1..j6, action_gripper`. Velocities included for analysis. No extra dependencies.
+
+**LeRobot v2.1** — standard dataset layout for policy training with [LeRobot](https://github.com/huggingface/lerobot) and XPolicyLab/pi0.5:
+
+```
+out/yam_teleop_dataset/
+├── meta/
+│   ├── info.json          # robot_type, fps, feature shapes/names
+│   ├── episodes.jsonl     # per-episode length and task
+│   ├── stats.json         # per-feature min/max/mean/std
+│   └── tasks.jsonl        # task label
+└── data/
+    └── chunk-000/
+        └── episode_NNNNNN.parquet   # one per demo
+```
+
+Each parquet row has `observation.state` (joint positions + gripper, 7D per arm), `action` (commanded joint targets + gripper, 7D per arm), `episode_index`, `frame_index`, `timestamp`, and `next.done`. State and action share the same physical dimensions, enabling pi0.5's relative-action mode. When cameras are present, `observation.images.<name>` references the corresponding mp4 video file. Use `--fps 30` to resample to camera rate.
+
 ## Live dashboard
 
 The dashboard (`deployment/dashboard.py` + `deployment/dashboard.html`) streams live telemetry to the browser via Server-Sent Events (SSE) at ~10 Hz. Zero external dependencies — just Python stdlib `http.server`.
@@ -107,6 +141,8 @@ The dashboard (`deployment/dashboard.py` + `deployment/dashboard.html`) streams 
 | `SimArm` | `robot.py` | i2rt's MuJoCo `SimRobot` — same `Robot` protocol as hardware. Preferred for development. |
 | `DemoRecorder` | `recorder.py` | Appends per-tick data to in-memory buffers. `detach()` hands off a snapshot for background HDF5 writing. |
 | `Dashboard` | `dashboard.py` | SSE server for live telemetry. `push(snapshot)` fans out to all connected browsers via `_Broker`. |
+| `WristCamera` | `camera_capture.py` | Threaded USB camera grab. `latest()` returns the newest frame without blocking. |
+| `export_demos` | `export_demos.py` | Converts HDF5 demos to CSV or LeRobot v2.0 parquet datasets for policy training. |
 
 ## Files
 
@@ -118,11 +154,13 @@ deployment/
   dashboard.py       Live SSE dashboard server (Dashboard, _Broker, zero deps)
   dashboard.html     Single-page dashboard UI (dark theme, dynamic arm cards)
   inspect_demo.py    CLI tool to inspect recorded HDF5 demos
+  export_demos.py    Export HDF5 demos to CSV or LeRobot v2.0 format
   config.py          YAML config loader with validation
   config.yaml        Right arm config (hand, channel, backend, safety limits, tuning)
   config_left.yaml   Left arm config
   preflight.py       Pre-flight checks for real hardware
   camera.py          One Euro filter implementation
+  camera_capture.py  Threaded USB camera capture (WristCamera, open_cameras)
   calibration/       Saved operator frame calibration files
   record_pose.py     Hand-guide a pose and save it
 docs/
@@ -143,6 +181,8 @@ Each arm has its own YAML config (`deployment/config.yaml`, `deployment/config_l
 
 **`deploy`** — Poses: `home_joint_position_rad` (park pose), `reset_joint_position_rad` (startup pose).
 
+**`cameras`** — Wrist cameras (optional). Each entry maps a name to `device` (/dev/videoN), `width`, `height`, `fps`. Enabled with `--cameras`.
+
 ### Tuning tips
 
 - **Arm feels sluggish:** Raise `position_scale` (1.0 = 1:1), `max_tray_speed_m_s`, `max_command_velocity_rad_s`.
@@ -159,6 +199,6 @@ The configs ship with the correct CAN adapter serials and channel mappings for o
 
 ## Known gaps
 
-- **No cameras.** `camera.py` is just the One Euro filter. No camera feed into the headset yet.
+- **No camera feed into the headset.** Wrist cameras record to HDF5, but there is no live preview in the Quest.
 - **No collision checking.** The operator joint box is the only thing keeping arms apart.
 - **Dashboard is view-only.** No controls for starting/stopping recording from the browser yet.

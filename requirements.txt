@@ -5,6 +5,8 @@ mink
 quadprog
 pyyaml
 h5py
+pyarrow
+opencv-python-headless
 
 # i2rt supplies the YAM model and the arm driver, and is needed even with
 # --backend sim, because TeleopIK builds its model from i2rt's own MJCF.

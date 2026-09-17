@@ -1034,6 +1034,7 @@ class TeleopSession:
     extra: list[tuple[dict, np.ndarray | None]] | None = None,
     record_dir: Path | None = None,
     dashboard_port: int | None = None,
+    cameras: dict | None = None,
   ):
     validate_config(config)
     teleop = config["teleop"]
@@ -1072,7 +1073,9 @@ class TeleopSession:
     self._last_print_s = 0.0
 
     self._record_dir = record_dir
-    self._recorder = DemoRecorder(hands=hands, hz=1.0 / self._period_s) if record_dir else None
+    self._cameras = cameras or {}
+    camera_names = list(self._cameras.keys()) if self._cameras else []
+    self._recorder = DemoRecorder(hands=hands, hz=1.0 / self._period_s, camera_names=camera_names) if record_dir else None
     self._writers: list[threading.Thread] = []
 
     self._dashboard: Dashboard | None = None
@@ -1136,6 +1139,8 @@ class TeleopSession:
       except Exception as exc:
         errors.append(str(exc))
     self._finish_recording()
+    for cam in self._cameras.values():
+      cam.close()
     if self._dashboard is not None:
       self._dashboard.close()
     if errors:
@@ -1194,6 +1199,8 @@ class TeleopSession:
         with self._lock:
           mode = self._mode
         self._recorder.tick(states, targets, samples, self._channels, mode, now)
+        if self._cameras:
+          self._recorder.tick_cameras(self._cameras)
 
       tick = time.perf_counter()
       period = max(tick - last, 1.0e-6)
@@ -1676,6 +1683,15 @@ def main() -> None:
     ),
   )
   parser.add_argument(
+    "--cameras",
+    action="store_true",
+    help=(
+      "Enable wrist cameras. Requires a 'cameras' section in the primary config "
+      "mapping camera names to /dev/videoN devices. Frames are stored in HDF5 "
+      "demos when recording."
+    ),
+  )
+  parser.add_argument(
     "--dashboard",
     type=int,
     nargs="?",
@@ -1788,8 +1804,17 @@ def main() -> None:
       sample = reader.sample(cfg["teleop"]["hand"])
       if sample is None or time.monotonic() - sample.received_s > float(teleop["watchdog_s"]):
         raise RuntimeError("Fresh controller input is required before opening an arm")
+    cameras = {}
+    if args.cameras:
+      from deployment.camera_capture import open_cameras
+      cameras = open_cameras(config)
+      if cameras:
+        print(f"cameras: {', '.join(f'{n} ({c.resolution[0]}x{c.resolution[1]})' for n, c in cameras.items())}")
+      else:
+        print("--cameras: no 'cameras' section in config; skipping")
+
     try:
-      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra, record_dir=args.record, dashboard_port=args.dashboard)
+      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra, record_dir=args.record, dashboard_port=args.dashboard, cameras=cameras)
     except Exception as exc:
       backend = args.backend or config["robot"]["backend"]
       if backend == "i2rt":
