@@ -92,12 +92,13 @@ class Regressions(unittest.TestCase):
         self.assertEqual(s.status()["mode"],qt.PARKED)
         self.assertTrue(all(not c._engaged for c in s.channels))
 
-    def test_fault_never_requests_park(self):
-        s=self.session(); state=s.channels[0].read_state()
-        state.joint_velocity=np.ones(6)*99
-        with patch.object(s,"_begin_return") as park:
-            with self.assertRaises(RuntimeError): s._step([state],{"right":sample()},time.monotonic())
-            park.assert_not_called()
+    def test_runaway_trip_parks_both_arms(self):
+        s=self.session(True); a,b=s.channels
+        state=a.read_state(); state.joint_velocity=np.ones(6)*99
+        targets=s._step([state,b.read_state()],{"right":sample(),"left":sample("left")},time.monotonic())
+        self.assertIsNotNone(s.status()["fault"])
+        self.assertEqual(s.status()["mode"],qt.RETURNING)
+        self.assertEqual(len(targets),2)
 
     def test_joint_command_rate_bound(self):
         s=self.session(); c=s.channels[0]; prev=c._last_command.copy()

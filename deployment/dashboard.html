@@ -278,7 +278,7 @@
   <div class="card rec-status" id="recCard">
     <div class="indicator idle" id="recIndicator">IDLE</div>
     <div class="timer" id="recTimer"></div>
-    <div class="ticks" id="recTicks">joystick click to record</div>
+    <div class="ticks" id="recTicks">start teleop with --record</div>
   </div>
 
   <!-- Mode + global -->
@@ -384,6 +384,7 @@ function buildArmHTML(label) {
       </div>
       <h2>Joint Positions (pos / target)</h2>
       ${joints}
+      <div id="${id}_limits" style="font-size:12px;margin-top:8px"></div>
       <div style="margin-top:8px">
         <h2>Gripper</h2>
         <div style="display:flex;align-items:center;gap:8px">
@@ -451,13 +452,15 @@ function render(d) {
     recInd.textContent = 'REC';
     recInd.className = 'indicator recording';
     $('recTimer').textContent = formatTime(rec.duration_s || 0);
-    $('recTicks').textContent = (rec.ticks || 0) + ' ticks';
+    $('recTicks').textContent = (rec.ticks || 0) + ' ticks' + (rec.task ? ' — ' + rec.task : '');
     $('recCard').style.borderColor = 'var(--red)';
   } else {
-    recInd.textContent = 'IDLE';
+    recInd.textContent = rec.armed ? 'ARMED' : 'IDLE';
     recInd.className = 'indicator idle';
     $('recTimer').textContent = '';
-    $('recTicks').textContent = 'joystick click to record';
+    $('recTicks').textContent = rec.armed
+      ? `click either joystick to record — ${rec.episodes || 0} complete${rec.finalizing ? `, ${rec.finalizing} finalizing` : ''}`
+      : (rec.enabled ? 'waiting for recording data' : 'start teleop with --record');
     $('recCard').style.borderColor = '';
   }
 
@@ -475,6 +478,11 @@ function renderArm(arm, samples) {
   const joints = arm.joints || [];
   const targets = arm.targets || [];
   const pinned = arm.pinned || [];
+  const limits = document.getElementById(id + '_limits');
+  if (limits) {
+    const error = Math.max(0, ...(arm.tracking_error_rad || []).map(Math.abs));
+    limits.textContent = `Max tracking error: ${error.toFixed(3)} rad | Joint speed cap: ${arm.joint_speed_limit_rad_s ?? '--'} rad/s${arm.joint_speed_limited ? ' (ACTIVE)' : ''}`;
+  }
 
   // Clutch badge
   const clutch = document.getElementById(id + '_clutch');
@@ -571,7 +579,7 @@ function fetchDemos() {
       list.innerHTML = demos.map(d => `
         <div class="demo-item">
           <span class="name">${esc(d.name)}</span>
-          <span class="meta">${d.duration_s || '?'}s &middot; ${d.ticks || '?'} ticks &middot; ${(d.arms || []).join(', ')} &middot; ${d.size_kb || '?'} KB</span>
+          <span class="meta">${esc(d.status || '?')} &middot; ${d.duration_s || '?'}s &middot; ${d.ticks || 0} valid frames &middot; ${(d.arms || []).join(', ')} &middot; ${esc(d.task || '')}</span>
         </div>`).join('');
     })
     .catch(() => {});

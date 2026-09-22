@@ -1,0 +1,46 @@
+{
+  "status": "complete",
+  "errors": [],
+  "missing_images": [],
+  "raw_captures": 512,
+  "valid_training_rows": 300,
+  "rejected_captures": 212,
+  "raw_control_ticks": 1702,
+  "control_hz": 99.97123980825741,
+  "control_period_ms": {
+    "min": 2.127681,
+    "median": 9.999533,
+    "p95": 10.276566,
+    "max": 20.800114
+  },
+  "camera_hz": {
+    "left": 30.000210177597722,
+    "right": 30.000243531388666
+  },
+  "camera_to_control_skew_ms": {
+    "min": 0.056672,
+    "median": 5.18301,
+    "p95": 9.8874011,
+    "max": 11.541918
+  },
+  "pair_timestamp_skew_ms": {
+    "min": 0.0,
+    "median": 0.018,
+    "p95": 0.0825,
+    "max": 0.384
+  },
+  "image_delivery_ms": {
+    "min": 38.331911,
+    "median": 42.52906,
+    "p95": 44.9824562,
+    "max": 72.351042
+  },
+  "arm_read_span_ms": {
+    "min": 0.058978,
+    "median": 0.1245475,
+    "p95": 0.20105559999999997,
+    "max": 1.666643
+  },
+  "encoder_cache_age": "unknown; read intervals are software timestamps",
+  "max_writer_queue": 2
+}

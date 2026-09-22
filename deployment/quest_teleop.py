@@ -25,11 +25,19 @@ Control path, per tick, at ``teleop.control_hz``:
    pose into a joint target inside the safety envelope (command offset, the
    operator's joint box intersected with the arm's mechanical limits).
 
-Startup holds the current position. B/Y pauses both arms; A/X resumes after
-a pause. Faults latch until restart. No automatic homing or parking is used.
-Exiting closes the motor drivers: support the arms before Ctrl-C.
+Startup holds the current position. B/Y pauses both arms and walks them to
+their captured startup pose; A/X re-homes to the training reset pose. Faults
+latch until restart. Ctrl-C enters gravity comp (arms float, do not fall) and
+waits for the operator to confirm before disabling motors.
 
 `--dump` prints the controller stream and touches no hardware at all.
+
+`--record DIR` arms joystick-delimited recording to DIR from the two ZED X
+wrist cameras and the overhead ZED X (see `deployment/zed_capture.py`),
+timestamp-matched against this loop's state/action ticks
+(`deployment/recording.py`). Either joystick click starts an episode, the
+same click ends it and it finalizes in the background while teleop stays
+live; any number of episodes per run. Requires both arms and `--gripper`.
 """
 
 from __future__ import annotations
@@ -56,8 +64,6 @@ from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 from balancing_act.assets import YAM_ARM_HOME_JOINT_POS, YAM_ARM_HOME_VERIFIED
 from deployment.camera import OneEuroFilter
 from deployment.config import load_deployment_config, validate_config
-from deployment.dashboard import Dashboard
-from deployment.recorder import DemoRecorder, DemoSnapshot, write_snapshot
 from deployment.robot import ArmState, make_arm
 
 # The headset app, its log tag, and where to get it. The app is `oculus_reader`'s
@@ -1032,9 +1038,6 @@ class TeleopSession:
     backend: str | None = None,
     frame: np.ndarray | None = None,
     extra: list[tuple[dict, np.ndarray | None]] | None = None,
-    record_dir: Path | None = None,
-    dashboard_port: int | None = None,
-    cameras: dict | None = None,
   ):
     validate_config(config)
     teleop = config["teleop"]
@@ -1071,21 +1074,20 @@ class TeleopSession:
     print_hz = float(teleop["print_hz"])
     self._print_period_s = 0.0 if print_hz <= 0.0 else 1.0 / print_hz
     self._last_print_s = 0.0
+    self._console_paused = threading.Event()
 
-    self._record_dir = record_dir
-    self._cameras = cameras or {}
-    camera_names = list(self._cameras.keys()) if self._cameras else []
-    self._recorder = DemoRecorder(hands=hands, hz=1.0 / self._period_s, camera_names=camera_names) if record_dir else None
-    self._writers: list[threading.Thread] = []
-
-    self._dashboard: Dashboard | None = None
-    if dashboard_port is not None:
-      self._dashboard = Dashboard(port=dashboard_port, record_dir=record_dir)
-      self._dashboard.start()
-    self._last_dashboard_push_s = 0.0
+    # Guards recorder/_record_tick: main() begins/ends an episode from its own
+    # thread while the control loop keeps running, not just before start().
+    self.recorder = None
+    self._recorder_lock = threading.Lock()
+    self._record_tick = 0
 
     self._lock = threading.Lock()
-    self._button_edges = {hand: {"home": True, "stop": False, "js_click": False} for hand in hands}
+    self._button_edges = {hand: {"home": True, "stop": False, "record": False} for hand in hands}
+    # Require seeing each stick released after startup: a stick already held
+    # while the session comes up must not arm an episode by accident.
+    self._record_release_seen = {hand: False for hand in hands}
+    self._record_requested_by: str | None = None
     self._mode = IDLE
     self._fault: str | None = None
     self._note = "holding current position; release clutch before engaging"
@@ -1106,11 +1108,48 @@ class TeleopSession:
   def channels(self) -> list[ArmChannel]:
     return list(self._channels)
 
+  @property
+  def record_ticks(self) -> int:
+    with self._recorder_lock:
+      return self._record_tick
+
+  def begin_episode(self, recorder: Any) -> None:
+    with self._recorder_lock:
+      if self.recorder is not None:
+        raise RuntimeError("an episode is already recording")
+      self._record_tick = 0
+      self.recorder = recorder
+
+  def end_episode(self, recorder: Any) -> None:
+    """Stop producing controls for recorder after any in-flight tick finishes."""
+    with self._recorder_lock:
+      if self.recorder is recorder:
+        self.recorder = None
+
   def start(self) -> None:
     self._thread.start()
 
   def alive(self) -> bool:
     return self._thread.is_alive()
+
+  def take_record_request(self) -> str | None:
+    """Return and consume the hand whose fresh thumbstick click armed recording."""
+    with self._lock:
+      hand = self._record_requested_by
+      self._record_requested_by = None
+      return hand
+
+  def clear_record_request(self) -> None:
+    """Discard clicks made while the terminal was asking for an episode name."""
+    with self._lock:
+      self._record_requested_by = None
+
+  def pause_console_status(self, paused: bool) -> None:
+    if paused:
+      self._console_paused.set()
+    else:
+      self._last_print_s = time.monotonic()
+      self._console_paused.clear()
 
   def enter_gravity_comp(self) -> None:
     """Stop the control loop and enter gravity comp. Arms float but don't fall.
@@ -1138,11 +1177,6 @@ class TeleopSession:
         channel.close()
       except Exception as exc:
         errors.append(str(exc))
-    self._finish_recording()
-    for cam in self._cameras.values():
-      cam.close()
-    if self._dashboard is not None:
-      self._dashboard.close()
     if errors:
       raise RuntimeError("Driver shutdown failed; use emergency stop: " + "; ".join(errors))
     self._closed = True
@@ -1151,6 +1185,10 @@ class TeleopSession:
     try:
       self._loop()
     except BaseException as exc:
+      with self._recorder_lock:
+        recorder = self.recorder
+      if recorder is not None:
+        recorder.fail(f"control loop failed: {exc}")
       with self._lock:
         self._fault = f"Control loop failed: {exc}"
         self._mode = FAULT
@@ -1175,7 +1213,13 @@ class TeleopSession:
     while not self._shutdown.is_set():
       # Every arm is read, then every arm is commanded: both channels are
       # computed from one tick, so a recorded frame is a consistent snapshot.
-      states = [channel.read_state() for channel in self._channels]
+      # Each read is timestamped so a recorded control sample can be matched
+      # to camera frames by the earliest read start (see deployment.recording).
+      states, read_intervals = [], []
+      for channel in self._channels:
+        before = time.monotonic_ns()
+        states.append(channel.read_state())
+        read_intervals.append((before, time.monotonic_ns()))
       for channel, state in zip(self._channels, states):
         if np.max(np.abs(channel._last_command - state.joint_position)) > channel._ik._max_offset_rad + 1e-6:
           raise RuntimeError(f"{channel.label}: arm is not following its target")
@@ -1191,16 +1235,46 @@ class TeleopSession:
       for sample in fresh_samples:
         if not stop_pressed or sample.stop:
           self._apply_buttons(sample)
+      mode_before = self._mode
       targets = self._step(states, samples, now)
+      command_intervals = []
       for channel, target in zip(self._channels, targets):
+        before = time.monotonic_ns()
         channel.command(target)
+        command_intervals.append((before, time.monotonic_ns()))
 
-      if self._recorder is not None:
+      with self._recorder_lock:
+        recorder = self.recorder
+      if recorder is not None:
+        from deployment.recording import ControlSample
         with self._lock:
-          mode = self._mode
-        self._recorder.tick(states, targets, samples, self._channels, mode, now)
-        if self._cameras:
-          self._recorder.tick_cameras(self._cameras)
+          mode_after = self._mode
+          fault = self._fault
+        order = sorted(range(len(self._channels)), key=lambda i: self._channels[i].hand)
+        state_vector = tuple(float(v) for i in order for v in
+                             np.append(states[i].joint_position, states[i].gripper_position
+                                       if states[i].gripper_position is not None else np.nan))
+        action_vector = tuple(float(v) for i in order for v in self._channels[i]._last_command)
+        fresh = all(samples[c.hand] is not None and
+                    now - samples[c.hand].received_s <= self._watchdog_s for c in self._channels)
+        valid = mode_before in {IDLE, ENGAGED} and mode_after in {IDLE, ENGAGED} and fault is None and fresh
+        valid = valid and read_intervals[-1][1] - read_intervals[0][0] <= 25_000_000
+        valid = valid and bool(np.isfinite(state_vector + action_vector).all())
+        # Failed/missing numeric readings remain explicit nulls in raw diagnostics.
+        clean = lambda values: tuple(v if np.isfinite(v) else None for v in values)
+        control_sample = ControlSample(
+          self._record_tick, read_intervals[0][0], clean(state_vector), clean(action_vector),
+          mode_after, tuple(read_intervals[i] for i in order),
+          tuple(command_intervals[i] for i in order),
+          tuple(int(samples[self._channels[i].hand].received_s * 1e9)
+                if samples[self._channels[i].hand] else 0 for i in order),
+          valid, "" if valid else "transitional_fault_stale_or_missing_state")
+        # Serialize the final enqueue with the lock: end_episode() can run
+        # right after this without a late control arriving for it.
+        with self._recorder_lock:
+          if self.recorder is recorder:
+            recorder.add_control(control_sample)
+            self._record_tick += 1
 
       tick = time.perf_counter()
       period = max(tick - last, 1.0e-6)
@@ -1212,7 +1286,6 @@ class TeleopSession:
         alpha = min(1.0, self._period_s / 0.5)
         self._measured_hz = (1.0 - alpha) * self._measured_hz + alpha / period
       self._maybe_print(samples, now)
-      self._maybe_push_dashboard(samples, targets, now)
 
       next_tick += self._period_s
       sleep_s = next_tick - time.perf_counter()
@@ -1223,8 +1296,9 @@ class TeleopSession:
         next_tick = time.perf_counter()
 
   def _apply_buttons(self, sample: ControllerSample) -> None:
-    """B/Y pauses. A/X resumes a deliberate pause, never a fault.
-    Joystick click toggles recording (when --record is active)."""
+    """B/Y pauses. A/X resumes a deliberate pause, never a fault. Either
+    joystick click arms or stops a --record episode; main() owns the
+    recorder itself, this just surfaces the request via take_record_request()."""
     if time.monotonic() - sample.received_s > self._watchdog_s:
       return
     js_key = "RJ" if sample.hand == "right" else "LJ"
@@ -1233,30 +1307,22 @@ class TeleopSession:
       edges = self._button_edges[sample.hand]
       stop = sample.stop and not edges["stop"]
       resume = sample.home and not edges["home"]
-      js_click = js_pressed and not edges["js_click"]
-      edges.update(stop=sample.stop, home=sample.home, js_click=js_pressed)
+      record_click = js_pressed and not edges["record"]
+      if not js_pressed:
+        self._record_release_seen[sample.hand] = True
+      edges.update(stop=sample.stop, home=sample.home, record=js_pressed)
       if stop:
         self._mode = FAULT if self._fault else PARKED
         self._note = "paused; A/X resumes, then release and press clutch"
         for channel in self._channels:
           channel.release_input()
           channel.hold = channel._last_command.copy()
-        if self._recorder is not None and self._recorder.recording:
-          self._save_recording()
       elif resume and self._mode == PARKED and self._fault is None:
         self._begin_move(HOMING, [channel.reset_pose for channel in self._channels])
         self._note = "homing to start position..."
-      if js_click and self._recorder is not None:
-        if self._recorder.recording:
-          self._save_recording()
-        elif self._mode in {PARKED, FAULT}:
-          # Parking already saved whatever was running; starting again here
-          # would only capture a stationary arm.
-          self._note = "resume with A/X before recording"
-        else:
-          self._recorder.start()
-          self._note = "RECORDING started (joystick click to stop)"
-          print("\n*** RECORDING STARTED ***", flush=True)
+      if record_click and self._record_release_seen[sample.hand] and self._record_requested_by is None:
+        self._record_requested_by = sample.hand
+        self._note = f"recording requested from the {sample.hand} joystick"
 
   def _step(
     self,
@@ -1270,7 +1336,11 @@ class TeleopSession:
       try:
         channel.check_velocity(state)
       except RuntimeError as exc:
-        raise RuntimeError(f"{channel.label}: {exc}; no parking move will be attempted") from exc
+        with self._lock:
+          if self._fault is None:
+            self._fault = f"{channel.label}: {exc}"
+            self._note = "runaway trip; parking"
+            self._begin_return()
 
     with self._lock:
       missing = any(samples.get(c.hand) is None or not 0 <= now - samples[c.hand].received_s <= self._watchdog_s
@@ -1320,55 +1390,6 @@ class TeleopSession:
       self._mode = ENGAGED if any_engaged else IDLE
       return targets
 
-  # --------------------------------------------------------- recording helpers
-
-  def _save_recording(self) -> None:
-    """Detach the buffer and write it off the control thread.
-
-    Writing a demo takes tens to hundreds of milliseconds and grows with its
-    length; doing it here would stall the loop for whole control periods and
-    can trip the follow check on the next tick. `detach` is O(1), so only the
-    handoff happens on this thread. Caller holds self._lock.
-    """
-    if self._recorder is None:
-      return
-    snapshot = self._recorder.detach()
-    if snapshot is None:
-      self._note = "recording discarded (nothing captured)"
-      print("\n*** RECORDING DISCARDED (empty) ***", flush=True)
-      return
-    self._writers = [thread for thread in self._writers if thread.is_alive()]
-    writer = threading.Thread(
-      target=self._write_snapshot, args=(snapshot,), name="demo-writer", daemon=False
-    )
-    self._writers.append(writer)
-    writer.start()
-    self._note = f"saving {snapshot.num_ticks} ticks"
-
-  def _write_snapshot(self, snapshot: DemoSnapshot) -> None:
-    """Runs on a writer thread, never on the control loop."""
-    try:
-      path = write_snapshot(snapshot, self._record_dir)
-      print(
-        f"\n*** RECORDING SAVED: {path.name} "
-        f"({snapshot.num_ticks} ticks, {snapshot.duration_s:.1f}s) ***",
-        flush=True,
-      )
-    except Exception as exc:
-      print(f"\n*** RECORDING SAVE FAILED: {exc} ***", flush=True)
-
-  def _finish_recording(self) -> None:
-    """Flush an in-progress recording and wait for pending writes. Called
-    once the control thread has stopped, so detaching needs no lock."""
-    if self._recorder is None:
-      return
-    snapshot = self._recorder.detach()
-    if snapshot is not None:
-      self._write_snapshot(snapshot)
-    for writer in self._writers:
-      writer.join(timeout=60.0)
-    self._writers.clear()
-
   # ------------------------------------------------------------ moves/console
 
   def _begin_move(self, mode: str, targets: list[np.ndarray]) -> None:
@@ -1385,7 +1406,8 @@ class TeleopSession:
 
   def _maybe_print(self, samples: dict[str, ControllerSample | None], now: float) -> None:
     """The operator's live view: controller state in, arm state out."""
-    if self._print_period_s <= 0.0 or now - self._last_print_s < self._print_period_s:
+    if (self._console_paused.is_set() or self._print_period_s <= 0.0
+        or now - self._last_print_s < self._print_period_s):
       return
     self._last_print_s = now
     status = self.status()
@@ -1418,58 +1440,14 @@ class TeleopSession:
         line += f" lag={arm['lag_mm']:3.0f}mm"
       if arm["pinned"]:
         line += " pinned=j" + ",j".join(str(index) for index in arm["pinned"])
-    if self._recorder is not None:
-      if self._recorder.recording:
-        ticks = self._recorder.tick_count
-        secs = ticks * self._period_s
-        line += f"  [REC {secs:.0f}s]"
-      else:
-        line += "  [js=rec]"
+    with self._recorder_lock:
+      recording, ticks = self.recorder is not None, self._record_tick
+    if recording:
+      secs = ticks * self._period_s
+      line += f"  [REC {secs:.0f}s, {ticks} ticks]"
     if status["fault"]:
       line += f"  FAULT: {status['fault']}"
     _emit(line)
-
-  def _maybe_push_dashboard(
-    self,
-    samples: dict[str, ControllerSample | None],
-    targets: list[np.ndarray],
-    now: float,
-  ) -> None:
-    if self._dashboard is None:
-      return
-    # ~10 Hz to the browser — no need for 100 Hz visual updates.
-    if now - self._last_dashboard_push_s < 0.1:
-      return
-    self._last_dashboard_push_s = now
-    with self._lock:
-      status = {
-        "mode": self._mode,
-        "fault": self._fault,
-        "note": self._note,
-        "hz": round(self._measured_hz, 1),
-        "dashboard_clients": self._dashboard.client_count,
-        "arms": [],
-        "controller_samples": {},
-        "recording": {
-          "active": self._recorder.recording if self._recorder else False,
-          "ticks": self._recorder.tick_count if self._recorder else 0,
-          "duration_s": round(self._recorder.tick_count * self._period_s, 1) if self._recorder else 0,
-        },
-      }
-      for i, channel in enumerate(self._channels):
-        arm_status = channel.status()
-        arm_status["targets"] = targets[i].tolist() if i < len(targets) else []
-        status["arms"].append(arm_status)
-        sample = samples.get(channel.hand)
-        if sample is not None:
-          status["controller_samples"][channel.hand] = {
-            "position": sample.position.tolist(),
-            "quat": sample.quat.tolist(),
-            "trigger": float(sample.trigger),
-            "grip": float(sample.grip),
-            "clutch": bool(sample.clutch),
-          }
-    self._dashboard.push(status)
 
 
 def _emit(line: str) -> None:
@@ -1598,6 +1576,29 @@ def calibrate(reader: QuestReader, hand: str, path: Path) -> np.ndarray:
   raise RuntimeError("the adb logcat stream ended; is the Quest still attached?")
 
 
+def prompt_episode_task(session: TeleopSession, episode_number: int) -> str:
+  """Ask for a non-empty task label without pausing control or capture threads."""
+  if not sys.stdin.isatty():
+    raise RuntimeError(
+      "interactive task naming needs a terminal; pass --task when stdin is not interactive"
+    )
+  session.pause_console_status(True)
+  try:
+    print("\n┌──────────────────────────────────────────────┐", flush=True)
+    print(f"│ START EPISODE {episode_number:<30}│", flush=True)
+    print("│ Enter the task/instruction for this episode. │", flush=True)
+    print("└──────────────────────────────────────────────┘", flush=True)
+    while True:
+      task = input("Task name > ").strip()
+      if task:
+        return task
+      print("Task name cannot be empty.", flush=True)
+  finally:
+    # A click made while typing must not immediately stop the new episode.
+    session.clear_record_request()
+    session.pause_console_status(False)
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(prog="python -m deployment.quest_teleop")
   parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
@@ -1678,18 +1679,29 @@ def main() -> None:
     default=None,
     metavar="DIR",
     help=(
-      "Record demonstration data to HDF5 files in DIR. Recording starts/stops "
-      "with the right joystick click. Each segment saves automatically."
+      "Record joystick-delimited episodes into DIR from the ZED wrist/overhead "
+      "cameras (deployment/zed_capture.py) plus this loop's state/action "
+      "ticks. Recording is armed at startup; either joystick click starts an "
+      "episode, the same click ends it (finalizing in the background while "
+      "teleop stays live), any number of episodes per run. Requires "
+      "--second-config and --gripper."
     ),
   )
   parser.add_argument(
-    "--cameras",
-    action="store_true",
+    "--task",
+    action="append",
+    default=[],
     help=(
-      "Enable wrist cameras. Requires a 'cameras' section in the primary config "
-      "mapping camera names to /dev/videoN devices. Frames are stored in HDF5 "
-      "demos when recording."
+      "Task instruction stored with an episode. Without it, each start click "
+      "prompts in the terminal. One value is reused for every episode; repeat "
+      "to pre-supply different names in order."
     ),
+  )
+  parser.add_argument(
+    "--record-config",
+    type=Path,
+    default=Path(__file__).with_name("recording.yaml"),
+    help="Camera serials and writer settings for --record (default: deployment/recording.yaml).",
   )
   parser.add_argument(
     "--dashboard",
@@ -1705,6 +1717,11 @@ def main() -> None:
     ),
   )
   args = parser.parse_args()
+  if args.record and (not args.second_config
+                      or any(not task.strip() for task in args.task) or not args.gripper):
+    parser.error("--record requires --second-config and --gripper; --task values cannot be empty")
+  if args.record and (args.dump or args.calibrate):
+    parser.error("recording cannot be combined with --dump or --calibrate")
 
   config = load_deployment_config(args.config)
   teleop = config["teleop"]
@@ -1804,18 +1821,34 @@ def main() -> None:
       sample = reader.sample(cfg["teleop"]["hand"])
       if sample is None or time.monotonic() - sample.received_s > float(teleop["watchdog_s"]):
         raise RuntimeError("Fresh controller input is required before opening an arm")
-    cameras = {}
-    if args.cameras:
-      from deployment.camera_capture import open_cameras
-      cameras = open_cameras(config)
-      if cameras:
-        print(f"cameras: {', '.join(f'{n} ({c.resolution[0]}x{c.resolution[1]})' for n, c in cameras.items())}")
-      else:
-        print("--cameras: no 'cameras' section in config; skipping")
+
+    dashboard = None
+    if args.dashboard:
+      from deployment.dashboard import Dashboard
+      dashboard = Dashboard(port=args.dashboard, record_dir=args.record)
+      dashboard.start()
+      dashboard.push({"mode": "startup", "note": "Initializing cameras and hardware...", "arms": [], "hz": 0.0})
+
+    # ZED init is CPU/USB intensive and can take several seconds; warm the
+    # cameras before opening the real-time CAN arm drivers so camera startup
+    # cannot starve their motor command loops. Events are discarded until the
+    # recorder is attached immediately before control.
+    settings = None
+    capture = None
+    if args.record:
+      import yaml
+      from deployment.zed_capture import ZedPairCapture
+      settings = yaml.safe_load(args.record_config.read_text(encoding="utf-8"))
+      capture = ZedPairCapture(callback=lambda event: None, **settings["cameras"])
+      capture.start()
 
     try:
-      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra, record_dir=args.record, dashboard_port=args.dashboard, cameras=cameras)
+      session = TeleopSession(config, reader, backend=args.backend, frame=frame, extra=extra)
     except Exception as exc:
+      if dashboard:
+        dashboard.close()
+      if capture:
+        capture.close()
       backend = args.backend or config["robot"]["backend"]
       if backend == "i2rt":
         print(f"Could not open the arm: {exc}\n")
@@ -1838,22 +1871,132 @@ def main() -> None:
     else:
       print("trigger (or grip) drives the arm.")
     print("B/Y pauses both arms; A/X resumes. Release and press clutch to engage.")
-    if args.record:
-      print(f"Recording to {args.record}/. Click joystick to start/stop recording.")
     if args.dashboard:
       print(f"Dashboard: http://localhost:{args.dashboard}")
     print("B/Y parks the arms. After parking, Ctrl-C to begin shutdown.\n")
     is_real = any(ch.backend == "i2rt" for ch in session.channels)
-    session.start()
+
+    recorder = None
+    record_started_s: float | None = None
+    active_task: str | None = None
+    episode_index = 0
+    finalizers: list[threading.Thread] = []
+    last_dashboard_push_s = 0.0
+    camera_sides: tuple[str, ...] = ()
+    try:
+      if args.record:
+        assert settings is not None and capture is not None
+        for channel in session.channels:
+          if channel.read_state().gripper_position is None:
+            raise RuntimeError(f"{channel.hand}: recording requires measured gripper state")
+        camera_sides = ("left", "right") + (("overhead",)
+          if settings["cameras"].get("overhead_serial") is not None else ())
+      session.start()
+      if args.record:
+        print("Recording ARMED: click the left or right joystick to begin the episode.", flush=True)
+    except BaseException:
+      if dashboard:
+        dashboard.close()
+      if capture:
+        capture.close()
+      if recorder:
+        recorder.fail("startup failed")
+        recorder.close()
+      session.close()
+      raise
+
     try:
       while session.alive():
         if not reader.alive():
-          print("\nadb stream stopped.", flush=True)
+          print("\nadb logcat stopped; parking the arm.", flush=True)
           break
-        time.sleep(0.2)
+        requested_by = session.take_record_request()
+        if args.record and requested_by is not None:
+          assert settings is not None and capture is not None
+          if recorder is None:
+            if len(args.task) == 1:
+              next_task = args.task[0]
+            elif episode_index < len(args.task):
+              next_task = args.task[episode_index]
+            else:
+              next_task = prompt_episode_task(session, episode_index + 1)
+            from deployment.recording import EpisodeRecorder
+            recorder = EpisodeRecorder(args.record, task=next_task,
+              metadata={"configs": [config, second], "capture": settings,
+                        "control_hz": teleop["control_hz"],
+                        "episode_index": episode_index,
+                        "record_trigger": f"{requested_by}_joystick_click",
+                        "shutdown_return_policy": "B/Y or fault parks to the session-start pose; "
+                                                  "Ctrl-C enters gravity comp without auto-parking",
+                        "startup_joint_position_rad": {
+                          channel.hand: [float(value) for value in channel.start_pose]
+                          for channel in session.channels
+                        }}, camera_sides=camera_sides,
+              **settings["writer"])
+            # Controls build a causal history before the first emitted camera
+            # bundle. Cameras have remained warm and discarded frames until now.
+            session.begin_episode(recorder)
+            capture.begin_recording(recorder.add_capture, recorder.fail)
+            active_task = next_task
+            record_started_s = time.monotonic()
+            print(
+              f"\nRECORDING episode {episode_index + 1} ({active_task!r}) started by "
+              f"{requested_by} joystick: {recorder.path}", flush=True
+            )
+          else:
+            camera_status = capture.end_recording()
+            session.end_episode(recorder)
+            recorder.finish_controls()
+            closing = recorder
+            closing.metadata["camera_status"] = camera_status
+            recorder = None
+            stopped_task = active_task
+            active_task = None
+            record_started_s = None
+            episode_index += 1
+
+            def finalize_episode(episode: Any, number: int, task: str | None) -> None:
+              path = episode.close()
+              print(f"\nEpisode {number} ({task!r}) finalized: {path}", flush=True)
+
+            finalizer = threading.Thread(
+              target=finalize_episode,
+              args=(closing, episode_index, stopped_task),
+              name=f"episode-finalizer-{episode_index}",
+            )
+            finalizer.start()
+            finalizers.append(finalizer)
+            print(
+              f"\nRECORDING stopped by {requested_by} joystick; episode {episode_index} "
+              "is finalizing in the background. Teleop remains active and recording is ARMED.",
+              flush=True,
+            )
+        dashboard_now = time.monotonic()
+        if dashboard and dashboard_now - last_dashboard_push_s >= 0.2:
+          last_dashboard_push_s = dashboard_now
+          snapshot = session.status()
+          snapshot["controller_samples"] = {
+            hand: {"position": sample.position, "trigger": sample.trigger, "grip": sample.grip}
+            for hand, sample in reader.samples().items()
+          }
+          snapshot["recording"] = {
+            "enabled": args.record is not None,
+            "armed": args.record is not None and recorder is None,
+            "active": recorder is not None and not recorder.metadata.get("errors"),
+            "task": active_task,
+            "episodes": episode_index,
+            "finalizing": sum(thread.is_alive() for thread in finalizers),
+            "duration_s": time.monotonic() - record_started_s if record_started_s is not None else 0.0,
+            "ticks": session.record_ticks,
+          }
+          snapshot["dashboard_clients"] = dashboard.client_count
+          dashboard.push(snapshot)
+        time.sleep(0.01)
     except KeyboardInterrupt:
-      pass
+      print("\ninterrupted; parking the arm.", flush=True)
     finally:
+      # SDK close may hold Python's GIL for nearly a second. Park and stop
+      # control first, then tear down cameras and retain their final orphans.
       if is_real:
         session.enter_gravity_comp()
         print("\nArms in gravity comp — they will float but not fall.")
@@ -1864,6 +2007,20 @@ def main() -> None:
           pass
         print("Disabling motors...", flush=True)
       session.close()
+      if recorder:
+        session.end_episode(recorder)
+        recorder.finish_controls()
+      if capture:
+        capture.close()
+      if recorder:
+        recorder.metadata["camera_status"] = capture.status() if capture else {}
+        print(f"\nEpisode: {recorder.close()}", flush=True)
+      for finalizer in finalizers:
+        finalizer.join(timeout=30.0)
+        if finalizer.is_alive():
+          print(f"WARNING: {finalizer.name} is still flushing data", flush=True)
+      if dashboard:
+        dashboard.close()
     if session.status()["fault"]:
       raise RuntimeError(session.status()["fault"])
   finally:

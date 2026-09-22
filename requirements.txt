@@ -26,3 +26,10 @@ opencv-python-headless
 #
 # Real arms need Linux regardless: i2rt drives the motors over socketcan, which
 # has no Windows implementation. See the README for the WSL2 route.
+
+# --record uses the ZED SDK (deployment/zed_capture.py) for the two wrist
+# cameras and the overhead view. pyzed has no PyPI wheel: install the ZED SDK
+# for your platform from stereolabs.com, then run its bundled
+# get_python_api.py (or use the vendored wheel your Jetson image ships) to add
+# pyzed to this environment. Everything else runs fine without it; pyzed is
+# imported lazily and only --record touches it.

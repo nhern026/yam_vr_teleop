@@ -1,0 +1,20 @@
+cameras:
+  left_serial: 301058360
+  right_serial: 306353224
+  # ZED X 41925345 is the neutral/overhead view. ZED X Mini 53655029 is not used.
+  overhead_serial: 41925345
+  overhead_view: left
+  fps: 30
+  warmup_frames: 60
+  # Must be below half a frame period to avoid accepting adjacent exposures.
+  # Measure the inter-camera timestamp offset before widening this gate.
+  pair_tolerance_ms: 12.0
+  pending_frames: 4
+writer:
+  max_skew_ms: 35.0
+  queue_size: 300
+  min_free_gb: 2.0
+  jpeg_quality: 85
+  max_invalid_per_window: 15  # among the last 30 active captures
+# Wrist mounting confirmed in the shared setup conversation.
+camera_names: [cam_left_wrist, cam_right_wrist, cam_overhead]

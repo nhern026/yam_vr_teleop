@@ -9,7 +9,7 @@ Architecture:
   - ``GET /`` serves the embedded HTML dashboard.
   - ``GET /events`` is an SSE endpoint; the browser's ``EventSource`` reconnects
     automatically on drop.
-  - ``GET /demos`` returns a JSON list of saved HDF5 files in the record dir.
+  - ``GET /demos`` returns a JSON list of raw episode directories in the record dir.
   - ``push(snapshot_dict)`` is called from the teleop thread; it serialises to
     JSON once and fans out to every waiting SSE connection via a threading.Event
     per client.
@@ -25,14 +25,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
-_DASHBOARD_HTML: str | None = None
+_DASHBOARD_HTML: bytes | None = None
 
 
-def _load_html() -> str:
+def _load_html() -> bytes:
     global _DASHBOARD_HTML
     if _DASHBOARD_HTML is None:
         html_path = Path(__file__).with_name("dashboard.html")
-        _DASHBOARD_HTML = html_path.read_text()
+        _DASHBOARD_HTML = html_path.read_bytes()
     return _DASHBOARD_HTML
 
 
@@ -42,11 +42,17 @@ class _Broker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._clients: list[queue.Queue[str]] = []
+        self._last_snapshot: str | None = None
 
     def subscribe(self) -> queue.Queue[str]:
         q: queue.Queue[str] = queue.Queue(maxsize=4)
         with self._lock:
             self._clients.append(q)
+            if self._last_snapshot is not None:
+                try:
+                    q.put_nowait(self._last_snapshot)
+                except queue.Full:
+                    pass
         return q
 
     def unsubscribe(self, q: queue.Queue[str]) -> None:
@@ -58,6 +64,7 @@ class _Broker:
 
     def publish(self, data: str) -> None:
         with self._lock:
+            self._last_snapshot = data
             dead: list[queue.Queue[str]] = []
             for q in self._clients:
                 try:
@@ -84,26 +91,31 @@ _record_dir: Path | None = None
 
 
 def _list_demos() -> list[dict[str, Any]]:
-    if _record_dir is None:
+    if _record_dir is None or not _record_dir.is_dir():
         return []
     demos = []
-    for p in sorted(_record_dir.glob("*.hdf5"), reverse=True):
+    paths = sorted((p for p in _record_dir.iterdir()
+                    if p.is_dir() and (p / "metadata.json").is_file()),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in paths:
         try:
-            import h5py
-            with h5py.File(p, "r") as f:
-                demos.append({
-                    "name": p.name,
-                    "ticks": int(f.attrs.get("num_ticks", 0)),
-                    "duration_s": round(float(f.attrs.get("duration_s", 0)), 1),
-                    "arms": list(f.attrs.get("arms", [])),
-                    "start_time": str(f.attrs.get("start_time", "")),
-                    "size_kb": round(p.stat().st_size / 1024, 1),
-                })
+            metadata = json.loads((p / "metadata.json").read_bytes())
+            counts = metadata.get("counts", {})
+            configs = metadata.get("configs", [])
+            demos.append({
+                "name": p.name,
+                "ticks": int(counts.get("valid", 0)),
+                "duration_s": round(float(metadata.get("duration_s", 0)), 1),
+                "arms": [cfg.get("teleop", {}).get("hand", "?") for cfg in configs if cfg],
+                "task": str(metadata.get("task", "")),
+                "status": str(metadata.get("status", "unknown")),
+            })
         except Exception:
             demos.append({"name": p.name, "error": "could not read"})
     return demos
 
 
+import socket
 import socketserver
 
 
@@ -111,10 +123,33 @@ class _ReusableHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def __init__(self, server_address: tuple[str, int], RequestHandlerClass: type) -> None:
+        if server_address[0] == "::":
+            self.address_family = socket.AF_INET6
+        else:
+            self.address_family = socket.AF_INET
+        super().__init__(server_address, RequestHandlerClass)
+
+    def server_bind(self) -> None:
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except Exception:
+                pass
+        super().server_bind()
+
 
 class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format: str, *args: Any) -> None:
         pass
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.flush()
 
     def do_GET(self) -> None:
         if self.path == "/":
@@ -127,12 +162,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def _serve_html(self) -> None:
-        body = _load_html().encode("utf-8")
+        body = _load_html()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def _serve_demos(self) -> None:
         body = json.dumps(_list_demos()).encode("utf-8")
@@ -142,6 +178,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def _serve_sse(self) -> None:
         self.send_response(200)
@@ -150,6 +187,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        self.wfile.flush()
 
         q = _broker.subscribe()
         try:
@@ -180,11 +218,19 @@ class Dashboard:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._server = _ReusableHTTPServer(("0.0.0.0", self._port), _Handler)
+        try:
+            self._server = _ReusableHTTPServer(("::", self._port), _Handler)
+        except Exception:
+            self._server = _ReusableHTTPServer(("0.0.0.0", self._port), _Handler)
         self._server.timeout = 0.5
         self._thread = threading.Thread(target=self._serve, name="dashboard", daemon=True)
         self._thread.start()
-        print(f"Dashboard: http://localhost:{self._port}", flush=True)
+        import socket
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip = "JETSON_IP"
+        print(f"Dashboard: http://localhost:{self._server.server_port} (or http://{ip}:{self._server.server_port} from external browser)", flush=True)
 
     def _serve(self) -> None:
         assert self._server is not None
@@ -200,6 +246,9 @@ class Dashboard:
     def close(self) -> None:
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
 
     @property
     def client_count(self) -> int:
@@ -207,12 +256,18 @@ class Dashboard:
 
 
 def _json_default(obj: Any) -> Any:
-    """JSON serialiser for numpy types."""
+    """JSON serialiser for numpy and non-standard types."""
     import numpy as np
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    if isinstance(obj, (np.floating, np.float32, np.float64)):
+    if isinstance(obj, (np.floating, float)):
         return float(obj)
-    if isinstance(obj, (np.integer, np.int32, np.int64)):
+    if isinstance(obj, (np.integer, int)):
         return int(obj)
-    raise TypeError(f"Not JSON serializable: {type(obj)}")
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (set, tuple)):
+        return list(obj)
+    return str(obj)

@@ -19,10 +19,10 @@ Quest 3 (USB)
                      shared clock,
                      fault domain)
                            │
-                    ┌──────┼──────┐
-                    ▼      ▼      ▼
-                Recorder  Dashboard  Console
-                (HDF5)    (SSE@10Hz) (stdout)
+                    ┌──────┼──────┬───────────────┐
+                    ▼      ▼      ▼               ▼
+              EpisodeRecorder  Dashboard  Console  ZedPairCapture
+              (CSV + JPEG)    (SSE@10Hz) (stdout)  (own threads, 3 ZED cams)
 ```
 
 ## Control path (per tick, 100 Hz)
@@ -37,60 +37,76 @@ Releasing the clutch freezes the arm. Re-pressing re-anchors without jumping —
 
 ## Data recording
 
-The recorder (`deployment/recorder.py`) captures every signal in the system at the control loop rate (~100 Hz). Writing is decoupled from the loop — `tick()` appends to plain lists (cheap), `detach()` swaps them out in O(1), and `write_snapshot()` serializes to HDF5 on a background thread so the control loop never stalls.
+`--record DIR` arms the session; it does not start capturing. Either
+joystick click begins an episode (prompting for a task name, or taking one
+from `--task`), the same click ends it, and any number of episodes can run
+one after another in a single process. Two independent pieces cooperate,
+neither able to stall the other:
 
-Each HDF5 file contains per-arm datasets (keyed by hand: `/right/...`, `/left/...`):
+- **`ZedPairCapture`** (`deployment/zed_capture.py`) owns one grab thread per
+  camera (two wrist ZED X, one overhead ZED X) plus a `FramePairBroker` that
+  matches the wrist pair by timestamp and emits explicit orphan events for
+  frames whose mate never arrives — nothing is silently shifted onto the next
+  exposure. The cameras run continuously from startup to shutdown;
+  `begin_recording(on_frame, on_fail)` / `end_recording()` atomically swap
+  the frame callback between "route to this episode's recorder" and
+  "discard", so starting the next episode never re-pays ZED init cost.
+- **`EpisodeRecorder`** (`deployment/recording.py`) is constructed fresh per
+  episode. It receives a `ControlSample` from the control loop on every tick
+  (14D state, 14D action, mode, and the read/command nanosecond intervals
+  used for causal matching) and a capture event from `ZedPairCapture` on
+  every routed camera frame. A background thread matches each frame to the
+  most recent usable control sample within `max_skew_ms`, JPEG-encodes it,
+  and streams rows to `data.csv`.
 
-| Dataset | Shape | Description |
-|---------|-------|-------------|
-| `joint_position` | (N, 6) | Measured joint angles [rad] |
-| `joint_velocity` | (N, 6) | Measured joint velocities [rad/s] |
-| `joint_target` | (N, 6) | Commanded joint targets [rad] |
-| `gripper_position` | (N,) | Measured gripper opening [0-1] |
-| `gripper_command` | (N,) | Commanded gripper target [0-1] |
-| `ee_position` | (N, 3) | End-effector position [m] |
-| `ee_quaternion` | (N, 4) | End-effector orientation [xyzw] |
-| `controller_position` | (N, 3) | Quest controller position [m] |
-| `controller_quaternion` | (N, 4) | Quest controller orientation [xyzw] |
-| `controller_trigger` | (N,) | Trigger value [0-1] |
-| `controller_grip` | (N,) | Grip value [0-1] |
-| `controller_clutch` | (N,) | Clutch engaged [0/1] |
+`TeleopSession.begin_episode()`/`end_episode()` attach/detach the active
+recorder under `_recorder_lock` while the control loop keeps running;
+`take_record_request()` lets `main()` poll for the joystick click
+(`_apply_buttons` requires seeing the stick released once after startup
+before it can arm a request, so a stick already held at boot can't start an
+episode by accident). Ending an episode hands it to a background
+`episode-finalizer-N` thread — `finish_controls()` then `close()` — so
+closing/renaming the directory never blocks teleop or the next episode.
 
-Plus session-level data: `/timestamps` (N,) seconds since first tick, `/mode` (N,) session mode per tick, and file-level attrs (`start_time`, `hz`, `arms`, `num_ticks`, `duration_s`).
+Each episode is its own directory (named from the task and start time):
 
-When `--cameras` is enabled, each camera gets a group under `/cameras/<name>/`:
+| File | Contents |
+|------|----------|
+| `data.csv` | One row per camera capture: image paths, validity, matched control tick/timestamp, 14D state, 14D action. |
+| `debug_timing.csv` | Per-frame ZED/host/grab/retrieve timestamps, for diagnosing skew. |
+| `controls.jsonl` | Every control tick as JSON, matched to an image or not. |
+| `images/<side>/*.jpg` | Raw frames, named `<sequence>_<capture_index>.jpg`. |
+| `metadata.json` | `status` (`recording`/`complete`/`invalid`), `errors`, `counts`, `task`, `episode_index`, `record_trigger`, the configs used, `startup_joint_position_rad`. |
 
-| Dataset | Shape | Description |
-|---------|-------|-------------|
-| `frames` | (N,) vlen uint8 | JPEG-encoded frames, one per tick |
+State/action layout is fixed: `left arm(6), left gripper, right arm(6), right gripper`.
 
-Attributes: `width`, `height`, `codec` ("jpeg").
+`EpisodeRecorder.fail(reason)` marks the episode `invalid` in `metadata.json`
+without stopping the control loop or the session — B/Y, a control-loop
+exception, a stalled writer queue, or low disk space all route through it.
+`deployment.quest_teleop` also marks individual ticks invalid (transitional
+mode, stale/missing controller input, a >25 ms read span) without failing
+the whole episode; those become segment boundaries at export time, not lost
+data.
 
-### Exporting demos
+### Inspecting and exporting episodes
 
-`deployment/export_demos.py` converts HDF5 demos to training-friendly formats.
+`deployment/inspect_episode.py DIR` reports raw/valid capture counts, missing
+images, control/camera Hz, and camera-to-control skew — run it before
+exporting to catch a bad episode early.
 
-**CSV** exports the full proprioception: joint positions (6) + joint velocities (6) + gripper (1) = 13-dim state, plus 7-dim action (joint targets + gripper command), at the native 100 Hz.
+`deployment/export_dataset.py` turns one **complete** raw episode into
+training data:
 
-**LeRobot v2.1** exports the XPolicyLab-canonical 7-dim state (joint positions + gripper) and 7-dim action (joint targets + gripper command). State and action share physical dimensions, which enables relative-action mode. For bimanual demos, both arms are concatenated (14D state, 14D action). The `--fps` flag resamples to camera rate (e.g. 30 Hz) so proprioception/actions align with image timestamps. When demos contain camera data, mp4 videos are written alongside the parquet files.
-
-**CSV** — one file per demo per arm at full 100 Hz. Columns: `timestamp, state_pos_j1..j6, state_vel_j1..j6, state_gripper, action_j1..j6, action_gripper`. Velocities included for analysis. No extra dependencies.
-
-**LeRobot v2.1** — standard dataset layout for policy training with [LeRobot](https://github.com/huggingface/lerobot) and XPolicyLab/pi0.5:
-
-```
-out/yam_teleop_dataset/
-├── meta/
-│   ├── info.json          # robot_type, fps, feature shapes/names
-│   ├── episodes.jsonl     # per-episode length and task
-│   ├── stats.json         # per-feature min/max/mean/std
-│   └── tasks.jsonl        # task label
-└── data/
-    └── chunk-000/
-        └── episode_NNNNNN.parquet   # one per demo
-```
-
-Each parquet row has `observation.state` (joint positions + gripper, 7D per arm), `action` (commanded joint targets + gripper, 7D per arm), `episode_index`, `frame_index`, `timestamp`, and `next.done`. State and action share the same physical dimensions, enabling pi0.5's relative-action mode. When cameras are present, `observation.images.<name>` references the corresponding mp4 video file. Use `--fps 30` to resample to camera rate.
+1. **`segments()`** splits the raw stream at any invalid row or a timestamp
+   gap outside `[0.5, 1.5] × 1/fps` — no interpolation or resampling, so a
+   segment is exactly the original ticks.
+2. **`export()`** writes each segment as its own HDF5 file: `state`/`action`
+   split into `left_arm_joint_states` (6), `left_ee_joint_states` (1),
+   `right_arm_joint_states` (6), `right_ee_joint_states` (1), plus one RGB
+   uint8 `vision/<camera_name>/colors` dataset per view.
+3. **`to_lerobot()`** (run in XPolicyLab's LeRobot v2 environment, not the
+   Jetson capture environment) converts a list of those HDF5 segments into a
+   LeRobot v2 dataset for pi0.5/OpenPI training.
 
 ## Live dashboard
 
@@ -98,19 +114,19 @@ The dashboard (`deployment/dashboard.py` + `deployment/dashboard.html`) streams 
 
 **What you see:**
 
-- **Recording status** — pulsing red REC indicator with timer and tick count, or dim IDLE
+- **Recording status** — armed/active/finalizing, current task, episode count, duration and tick count, or dim IDLE when `--record` wasn't given
 - **Session card** — mode badge (idle/engaged/parked/fault), loop Hz, arm count, connected clients
 - **Per-arm cards** — 6 joint position bars (orange = pinned joint), position vs target values, gripper bar, end-effector XYZ, controller XYZ/trigger/grip, hand/tray travel vectors, lag in mm
-- **Saved demos** — auto-refreshing list of HDF5 files with duration, ticks, arms, file size
+- **Saved episodes** — auto-refreshing list of raw episode directories with task, status, duration, ticks, arms
 
 **Internals:**
 
-- Served from a daemon thread alongside the control loop
-- `_Broker` fan-out: one `publish()` call fans out to per-client queues; stale frames are dropped, dead clients are auto-removed
-- `_ReusableHTTPServer` = `ThreadingMixIn + HTTPServer` with `allow_reuse_address` and `daemon_threads`
+- Served from a daemon thread; pushed from the main thread's status-poll loop in `quest_teleop.main()`, not the control loop, so JSON serialization and network I/O never compete with real-time commands
+- `_Broker` fan-out: one `publish()` call fans out to per-client queues; stale frames are dropped, dead clients are auto-removed; a late-joining client gets the last snapshot immediately
+- `_ReusableHTTPServer` binds IPv6 (falling back to IPv4) with `allow_reuse_address` and `daemon_threads`
 - `serve_forever()` + `shutdown()` for clean exit
 - Keepalive comments every 15s prevent browser SSE timeout
-- `/demos` endpoint reads HDF5 file attrs via h5py
+- `/demos` endpoint reads each episode directory's `metadata.json`
 - Multiple browser tabs can connect simultaneously without interfering with arm control
 
 ## Terminology
@@ -139,10 +155,10 @@ The dashboard (`deployment/dashboard.py` + `deployment/dashboard.html`) streams 
 | `TeleopSession` | `quest_teleop.py` | State machine (idle/engaged/homing/parked/fault) over one or two `ArmChannel`s. Single loop, single clock. |
 | `I2rtArm` | `robot.py` | Real hardware backend. Claims the CAN bus (fcntl lock + USB serial verification), wraps `get_yam_robot(zero_gravity_mode=True)`. |
 | `SimArm` | `robot.py` | i2rt's MuJoCo `SimRobot` — same `Robot` protocol as hardware. Preferred for development. |
-| `DemoRecorder` | `recorder.py` | Appends per-tick data to in-memory buffers. `detach()` hands off a snapshot for background HDF5 writing. |
+| `EpisodeRecorder` | `recording.py` | Bounded async raw writer, one instance per episode. `add_control()`/`add_capture()` feed a background thread that timestamp-matches ticks to frames and streams CSV/JPEG to disk. `fail()` marks the episode invalid without stopping control. |
+| `ZedPairCapture` | `zed_capture.py` | Threaded capture across the two wrist ZED X cameras and the overhead ZED X, running continuously across episodes. `begin_recording()`/`end_recording()` swap the frame callback without restarting the cameras. `FramePairBroker` matches wrist frames and emits explicit orphan events. |
 | `Dashboard` | `dashboard.py` | SSE server for live telemetry. `push(snapshot)` fans out to all connected browsers via `_Broker`. |
-| `WristCamera` | `camera_capture.py` | Threaded USB camera grab. `latest()` returns the newest frame without blocking. |
-| `export_demos` | `export_demos.py` | Converts HDF5 demos to CSV or LeRobot v2.0 parquet datasets for policy training. |
+| `export_dataset` | `export_dataset.py` | `segments()`/`export()`/`to_lerobot()` — raw episode to gap-separated HDF5 segments to a LeRobot v2 dataset. |
 
 ## Files
 
@@ -150,19 +166,26 @@ The dashboard (`deployment/dashboard.py` + `deployment/dashboard.html`) streams 
 deployment/
   quest_teleop.py    Main teleop script (QuestReader, TeleopIK, TrayTarget, ArmChannel, TeleopSession)
   robot.py           Arm backends: I2rtArm (CAN), SimArm (MuJoCo), MockArm (first-order servo)
-  recorder.py        HDF5 demonstration recorder (DemoRecorder, write_snapshot)
+  zed_capture.py     Threaded ZED wrist/overhead capture (ZedPairCapture, FramePairBroker)
+  recording.py       Bounded async raw episode writer (EpisodeRecorder, ControlSample)
+  recording.yaml     ZED camera serials and EpisodeRecorder writer settings
+  export_dataset.py  Raw episode -> gap-separated HDF5 segments -> LeRobot v2
+  inspect_episode.py CLI tool to check a raw episode's integrity and timing
+  yam_policy.py      OpenPI YamInputs/YamOutputs transforms (14D state, 3 camera views)
+  openpi_config.py   OpenPI YamDataConfig / make_config() for training
   dashboard.py       Live SSE dashboard server (Dashboard, _Broker, zero deps)
   dashboard.html     Single-page dashboard UI (dark theme, dynamic arm cards)
-  inspect_demo.py    CLI tool to inspect recorded HDF5 demos
-  export_demos.py    Export HDF5 demos to CSV or LeRobot v2.0 format
   config.py          YAML config loader with validation
   config.yaml        Right arm config (hand, channel, backend, safety limits, tuning)
   config_left.yaml   Left arm config
   preflight.py       Pre-flight checks for real hardware
   camera.py          One Euro filter implementation
-  camera_capture.py  Threaded USB camera capture (WristCamera, open_cameras)
   calibration/       Saved operator frame calibration files
   record_pose.py     Hand-guide a pose and save it
+scripts/
+  openpi_yam.py      Entry point for stats/batch/train against openpi_config.make_config()
+  recording_smoke.py Sim end-to-end smoke test for the recording pipeline
+  bootstrap.sh        Create the project-local conda env (Jetson/aarch64 path)
 docs/
   architecture.md    This file
 balancing_act/
@@ -181,7 +204,7 @@ Each arm has its own YAML config (`deployment/config.yaml`, `deployment/config_l
 
 **`deploy`** — Poses: `home_joint_position_rad` (park pose), `reset_joint_position_rad` (startup pose).
 
-**`cameras`** — Wrist cameras (optional). Each entry maps a name to `device` (/dev/videoN), `width`, `height`, `fps`. Enabled with `--cameras`.
+Camera serials and writer tuning for `--record` live in `deployment/recording.yaml`, separate from the arm configs — see its inline comments for what each field does.
 
 ### Tuning tips
 
@@ -199,6 +222,6 @@ The configs ship with the correct CAN adapter serials and channel mappings for o
 
 ## Known gaps
 
-- **No camera feed into the headset.** Wrist cameras record to HDF5, but there is no live preview in the Quest.
+- **No camera feed into the headset.** The ZED cameras record to disk, but there is no live preview in the Quest.
 - **No collision checking.** The operator joint box is the only thing keeping arms apart.
-- **Dashboard is view-only.** No controls for starting/stopping recording from the browser yet.
+- **Dashboard is view-only.** Episodes start/stop from the joystick, not the browser — the dashboard only reflects state.

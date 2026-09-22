@@ -1,0 +1,19 @@
+name: yam-teleop
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy=2.2.6
+  - opencv
+  - h5py
+  - pyyaml
+  - pytest
+  - pip
+  - cmake
+  - swig
+  - ninja
+  - compilers
+  - pip:
+      - mujoco==3.13.0
+      - mink==1.1.0
+      - quadprog==0.1.13

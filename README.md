@@ -49,56 +49,59 @@ Run once per standing position. Saves a frame file that teleop reads automatical
 
 ### Data recording + dashboard
 
-Add `--record <dir>` to record demos and `--dashboard` to launch a live browser UI. These work with any teleop command above.
+`--record <dir> --gripper` arms joystick-delimited episode recording from the
+two ZED X wrist cameras and the overhead ZED X ([deployment/zed_capture.py](deployment/zed_capture.py)),
+timestamp-matched against the control loop's state/action ticks
+([deployment/recording.py](deployment/recording.py)). It requires both arms
+(`--second-config`) and `--gripper`; camera serials and writer settings come
+from [deployment/recording.yaml](deployment/recording.yaml) (override with
+`--record-config`). `--dashboard` launches a live browser UI and works with
+any teleop command above, recording or not.
 
 ```bash
-# Right arm with recording + dashboard
-.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --gripper --record demos/ --dashboard
+# Both arms, recording armed + dashboard
+.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --second-config deployment/config_left.yaml --gripper --record episodes/ --dashboard
 ```
 
 ```bash
-# Both arms with recording + dashboard
-.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --second-config deployment/config_left.yaml --gripper --record demos/ --dashboard
+# Sim, recording armed + dashboard (ZED cameras still required for --record)
+.venv/bin/python -m deployment.quest_teleop --backend sim --second-config deployment/config_left.yaml --gripper --record episodes/ --dashboard
 ```
 
 ```bash
-# Sim with recording + dashboard
-.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --record demos/ --dashboard
+# Dashboard on a custom port, no recording
+.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --dashboard 9090
+```
+
+Open `http://localhost:8080` (or your custom port) in a browser to see live joint angles, recording status, controller state, and saved episodes.
+
+**Recording:** `--record` arms the session but does not start capturing.
+Either joystick click begins an episode and prompts for a task name in the
+terminal (or reuses `--task`, given once for every episode or repeated to
+pre-supply names in order); the same click ends it. Ending an episode
+finalizes it on a background thread while teleop stays live and recording
+goes back to armed — any number of episodes per run. Each episode is a
+directory under `episodes/`, named from the task and start time, holding raw
+images, `data.csv`, and `metadata.json`.
+
+```bash
+# Inspect a raw episode's integrity and timing before exporting it
+.venv/bin/python -m deployment.inspect_episode episodes/place_vial_2026-09-21_at_02-14-05pm
 ```
 
 ```bash
-# Dashboard on a custom port
-.venv/bin/python -m deployment.quest_teleop --backend sim --gripper --record demos/ --dashboard 9090
+# Export one episode into per-segment HDF5 trajectories
+.venv/bin/python -m deployment.export_dataset episodes/place_vial_2026-09-21_at_02-14-05pm --output out/segments
 ```
 
 ```bash
-# Both arms with wrist cameras + recording + dashboard
-.venv/bin/python -m deployment.quest_teleop --config deployment/config.yaml --second-config deployment/config_left.yaml --gripper --cameras --record demos/ --dashboard
+# ... and also convert those segments into a LeRobot v2 dataset for XPolicyLab/pi0.5
+.venv/bin/python -m deployment.export_dataset episodes/place_vial_2026-09-21_at_02-14-05pm --output out/segments --lerobot-root out/yam_dataset --repo-id local/yam
 ```
 
-Open `http://localhost:8080` (or your custom port) in a browser to see live joint angles, recording status, controller state, and saved demos.
-
-**Recording:** joystick click to start, joystick click to stop. Parking (B/Y) auto-saves. Each segment saves as `demos/demo_YYYYMMDD_HHMMSS.hdf5`.
-
-```bash
-# Inspect a saved demo
-.venv/bin/python -m deployment.inspect_demo demos/demo_20260916_143022.hdf5
-```
-
-```bash
-# Export all demos to CSV (timestamp, 6 joints + gripper, targets)
-.venv/bin/python -m deployment.export_demos demos/ --csv out/csv
-```
-
-```bash
-# Export all demos to LeRobot v2.1 dataset (for XPolicyLab / pi0.5)
-.venv/bin/python -m deployment.export_demos demos/ --lerobot out/yam_teleop_dataset --fps 30
-```
-
-```bash
-# Export a single demo to both formats
-.venv/bin/python -m deployment.export_demos demos/demo_20260916_143022.hdf5 --csv out/csv --lerobot out/dataset
-```
+See [OPERATING.md](OPERATING.md) for the full teleop→record→export→train
+workflow, and [deployment/openpi_config.py](deployment/openpi_config.py) /
+[deployment/yam_policy.py](deployment/yam_policy.py) for the π0.5/OpenPI side.
 
 ### Other commands
 
@@ -121,7 +124,7 @@ Open `http://localhost:8080` (or your custom port) in a browser to see live join
 | Open gripper | Trigger while NOT clutched |
 | Pause both arms | B (right) / Y (left) |
 | Home to start position | A (right) / X (left) |
-| Start/stop recording | Joystick click (either hand, requires `--record`) |
+| Start/stop an episode | Joystick click, either hand (requires `--record`) |
 
 The gripper is proportional: squeezing the trigger halfway closes the gripper halfway, which matters for delicate tasks like handling vials.
 
@@ -137,8 +140,9 @@ The gripper is proportional: squeezing the trigger halfway closes the gripper ha
 | `--second-config <path>` | Second arm for bimanual |
 | `--backend sim` | MuJoCo sim (no hardware) |
 | `--gripper` | Enable gripper control |
-| `--record <dir>` | Enable HDF5 recording to directory |
-| `--cameras` | Enable wrist cameras (needs `cameras` section in config) |
+| `--record <dir>` | Arm joystick-delimited episode recording into directory (needs `--second-config`, `--gripper`) |
+| `--task <text>` | Task instruction for an episode; repeat to pre-supply names in order, or omit to be prompted |
+| `--record-config <path>` | Camera/writer settings for `--record` (default `deployment/recording.yaml`) |
 | `--dashboard [PORT]` | Start live dashboard (default 8080) |
 | `--calibrate` | Calibrate operator frame and exit |
 | `--dump` | Print raw controller stream and exit |
@@ -228,6 +232,15 @@ Paste the printed values into the arm's config under `deploy.reset_joint_positio
 4. **Record a start pose.** Run `record_pose` for each arm and paste the result into the config (see above).
 5. **Tighten the joint box.** The default `±3.0 rad` constrains nothing. There is **no collision checking** — the operator box is the only thing keeping two arms apart.
 
+### Jetson / conda setup
+
+The venv/`uv` route above targets a generic Linux dev machine. On a Jetson
+(aarch64), some of this stack has no manylinux wheel and is easier to pull
+from conda-forge: see [environment.yml](environment.yml) and
+`bash scripts/bootstrap.sh`, or [OPERATING.md](OPERATING.md) for the full
+bring-up-through-training workflow on that path. [HANDOVER.md](HANDOVER.md)
+has the hardware bring-up order and what is/isn't verified on real arms.
+
 ## Requirements
 
 - Linux (socketcan for CAN hardware)
@@ -236,3 +249,4 @@ Paste the printed values into the arm's config under `deploy.reset_joint_positio
 - `adb` on PATH
 - GS_USB CAN adapters (one per arm)
 - [i2rt](https://github.com/i2rt-robotics/i2rt) installed (provides YAM models, motor drivers, MuJoCo sim)
+- ZED SDK + `pyzed` only if using `--record` (see [requirements.txt](requirements.txt))
