@@ -9,9 +9,11 @@ the recorder then validates all three SDK timestamps and associates the bundle
 to arm/controller samples in software. There is no shared camera/encoder
 trigger, and the driver may return cached encoder readings.
 
-The USB CAN adapters are persistently named by adapter serial: right arm
-`can_right`, left arm `can_left`. Do not replace these with enumeration-dependent
-`can0`/`can1` names.
+The USB CAN adapters are pinned by adapter serial in the configs
+(`robot.adapter_serial`), not by udev-renamed interfaces: right arm is
+`channel: can1`, left arm is `channel: can0`. If `can0`/`can1` swap enumeration
+order on reboot, `robot.py`'s adapter-serial check catches it at open time
+rather than silently driving the wrong arm.
 
 ## 1. Environment
 
@@ -77,24 +79,25 @@ changing a port, updating the driver, or rebooting into a different device tree.
 ## 4. Configure and check the arms
 
 Use `deployment/config.yaml` for the right arm and `config_left.yaml` for the
-left. Preserve the established `can_right`/`can_left` mapping and 100 Hz rate. The shipped files
-still have `robot.gripper_type: no_gripper`; set this existing option to the
-actual mounted model before using `--gripper`. Recording refuses a missing
-measured gripper rather than fabricating the seventh value. The optional
+left. Preserve the established `can1` (right) / `can0` (left) channel mapping
+and 100 Hz rate. The shipped files already have `robot.gripper_type:
+linear_4310` set; confirm it still matches the actual mounted model before
+using `--gripper`. Recording refuses a missing measured gripper rather than
+fabricating the seventh value. The optional
 `teleop.gripper_closed` and `teleop.gripper_open` map trigger travel into driver
 units (defaults 0 and 1); confirm their meaning on the hardware.
 
 Once both physical CAN adapters are present, configure each interface:
 
 ```bash
-sudo ip link set can_right down
-sudo ip link set can_right type can bitrate 1000000
-sudo ip link set can_right txqueuelen 1000
-sudo ip link set can_right up
-sudo ip link set can_left down
-sudo ip link set can_left type can bitrate 1000000
-sudo ip link set can_left txqueuelen 1000
-sudo ip link set can_left up
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000
+sudo ip link set can1 txqueuelen 1000
+sudo ip link set can1 up
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 txqueuelen 1000
+sudo ip link set can0 up
 ```
 
 Confirm which physical arm each interface addresses; persist adapter naming
